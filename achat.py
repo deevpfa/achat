@@ -20,6 +20,7 @@ import mimetypes
 import os
 import re
 import queue
+import secrets
 import shlex
 import sys
 import textwrap
@@ -35,13 +36,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
-VERSION = "0.3.0"
-FORMAT_VERSION = "1"
+VERSION = "0.4.0"
+FORMAT_VERSION = "2"   # v2: sync-safe file names (seq-sender.nonce.md) and a declared byte size per message
 HUMAN = "human"
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
-MSG_FILE_RE = re.compile(r"^(\d{6})-([a-z0-9][a-z0-9_-]{0,31})\.md$")
+MSG_FILE_RE = re.compile(r"^(\d{6})-([a-z0-9][a-z0-9_-]{0,31})(?:\.([0-9a-f]{6,16}))?\.md$")
+SYNC_GRACE = 30.0   # seconds a gap in the numbering may last (a message still syncing) before it is ignored
 SCRIPT_PATH = Path(__file__).resolve()
 SCRIPT_DIR = SCRIPT_PATH.parent
 
@@ -251,6 +253,7 @@ class Config:
     created: str
     brief: str
     max_attachment_bytes: int = DEFAULT_MAX_ATTACHMENT_BYTES
+    format: int = 1
 
 
 @dataclass(frozen=True)
@@ -300,9 +303,12 @@ class Message:
     end: str  # "", END_PROPOSE or END_NOW
     body: str
     attachments: Tuple[Attachment, ...] = ()
+    id: str = ""          # file name without .md: unique even when two machines pick the same seq
+    arrived: float = 0.0  # local mtime: when the file landed here (sync gaps are timed with it)
 
     def to_json(self) -> Dict[str, object]:
         return {
+            "id": self.id,
             "seq": self.seq,
             "from": self.sender,
             "ts": self.ts,
@@ -439,6 +445,7 @@ class Room:
                     created=meta.get("created", ""),
                     brief=body.strip(),
                     max_attachment_bytes=int(meta.get("max_attachment_bytes", DEFAULT_MAX_ATTACHMENT_BYTES)),
+                    format=int(meta.get("format", 1)),
                 )
             except (KeyError, ValueError) as e:
                 raise ChatError(f"{path} is malformed ({e})") from None
@@ -449,21 +456,39 @@ class Room:
     def messages(self) -> List[Message]:
         self.config  # fail early and clearly if the room doesn't exist
         try:
-            names = sorted(n for n in os.listdir(self.msgs_dir) if MSG_FILE_RE.match(n))
+            names = [n for n in os.listdir(self.msgs_dir) if MSG_FILE_RE.match(n)]
         except FileNotFoundError:
             raise ChatError(f"room {self.name!r} has no msgs/ directory") from None
         out = []
         for n in names:
             msg = self._cache.get(n)
             if msg is None:
-                msg = self._cache[n] = self._read_message(n)
+                msg = self._read_message(n)
+                if msg is None:
+                    continue      # still arriving (synced folders): read it on a later pass
+                self._cache[n] = msg
             out.append(msg)
+        # One order on every machine, even when two of them used the same seq.
+        out.sort(key=lambda m: (m.seq, m.sender, m.id))
         return out
 
-    def _read_message(self, filename: str) -> Message:
+    def _read_message(self, filename: str) -> Optional[Message]:
         match = MSG_FILE_RE.match(filename)
         assert match
-        meta, body = parse_doc((self.msgs_dir / filename).read_text(encoding="utf-8"))
+        path = self.msgs_dir / filename
+        try:
+            raw = path.read_bytes()
+            arrived = path.stat().st_mtime
+        except FileNotFoundError:
+            return None
+        meta, body = parse_doc(raw.decode("utf-8", "replace"))
+        if "bytes" in meta or match.group(3):
+            # v2 files declare their body size: a partial file (mid-sync) doesn't match yet
+            try:
+                if len(body.encode("utf-8")) != int(meta.get("bytes", -1)):
+                    return None
+            except ValueError:
+                return None
         return Message(
             seq=int(match.group(1)),
             sender=match.group(2),
@@ -471,7 +496,21 @@ class Room:
             end={"true": END_NOW, "propose": END_PROPOSE}.get(meta.get("end", "").strip().lower(), ""),
             body=body.rstrip("\n"),
             attachments=parse_attachments(meta.get("attachments", "")),
+            id=filename[:-3],
+            arrived=arrived,
         )
+
+    def sync_gap(self, msgs: Sequence[Message], now: Optional[float] = None) -> Optional[int]:
+        """The first missing seq below the newest one, while it may still be syncing; else None.
+        On one machine seqs are always contiguous (the lock), so this only fires with synced folders."""
+        seqs = {m.seq for m in msgs}
+        if not seqs:
+            return None
+        missing = next((k for k in range(1, max(seqs)) if k not in seqs), None)
+        if missing is None:
+            return None
+        newest = max(m.arrived for m in msgs)
+        return missing if (time.time() if now is None else now) - newest < SYNC_GRACE else None
 
     # -- attachments ----------------------------------------------------------
 
@@ -521,15 +560,38 @@ class Room:
     def status(self, msgs: Optional[Sequence[Message]] = None) -> Status:
         return compute_status(self.config, self.messages() if msgs is None else msgs)
 
-    def cursor(self, who: str) -> int:
+    # -- what each participant has seen --------------------------------------
+    # A set of message ids, not a "read up to seq N" cursor: with synced folders a message can land
+    # late with an old seq, and a cursor would skip it forever. Legacy .cursor files still count.
+
+    def _legacy_cursor(self, who: str) -> int:
         try:
             return int((self.state_dir / f"{who}.cursor").read_text().strip() or 0)
         except (FileNotFoundError, ValueError):
             return 0
 
-    def set_cursor(self, who: str, seq: int) -> None:
-        if seq > self.cursor(who):
-            atomic_write(self.state_dir / f"{who}.cursor", f"{seq}\n")
+    def seen_ids(self, who: str) -> Set[str]:
+        try:
+            return {ln.strip() for ln in (self.state_dir / f"{who}.seen").read_text().splitlines() if ln.strip()}
+        except FileNotFoundError:
+            return set()
+
+    def unseen(self, who: str, msgs: Sequence[Message]) -> List[Message]:
+        seen, upto = self.seen_ids(who), self._legacy_cursor(who)
+        return [m for m in msgs if m.sender != who and m.id not in seen and m.seq > upto]
+
+    def mark_seen(self, who: str, msgs: Iterable[Message]) -> None:
+        seen = self.seen_ids(who)
+        new = {m.id for m in msgs if m.id and m.id not in seen}
+        if new:
+            atomic_write(self.state_dir / f"{who}.seen", "\n".join(sorted(seen | new)) + "\n")
+
+    def cursor(self, who: str) -> int:   # the highest seq this participant has seen (compat helper)
+        seen = self.seen_ids(who)
+        return max([self._legacy_cursor(who)] + [m.seq for m in self.messages() if m.id in seen])
+
+    def set_cursor(self, who: str, seq: int) -> None:   # compat helper: mark everything up to seq as seen
+        self.mark_seen(who, [m for m in self.messages() if m.seq <= seq])
 
     def require_participant(self, who: str) -> str:
         if who not in self.config.participants:
@@ -572,19 +634,25 @@ class Room:
                     f"attachment {name!r} is {human_size(len(data))}; this room allows {human_size(cfg.max_attachment_bytes)} per file",
                     EXIT_REJECTED,
                 )
-        with file_lock(self.dir / ".lock"):
+        if cfg.format > int(FORMAT_VERSION):
+            raise ChatError(f"room {self.name!r} uses format {cfg.format}; this achat ({VERSION}) only writes up to "
+                            f"format {FORMAT_VERSION}. Update achat.")
+        with file_lock(self.dir / ".lock"):   # local lock; across synced machines the turns and v2 names do the work
             msgs = self.messages()
             st = compute_status(cfg, msgs)
             if st.closed:
                 raise ChatError(f"the room is closed: {st.closed}", EXIT_CLOSED)
+            gap = self.sync_gap(msgs)
+            if gap is not None:
+                raise ChatError(f"message #{gap} hasn't synced to this machine yet; wait a few seconds. {hints.read()}",
+                                EXIT_REJECTED)
             if sender != HUMAN:
                 if sender != st.next_speaker:
                     raise ChatError(
                         f"it is not your turn — {st.next_speaker} speaks next. {hints.wait()}",
                         EXIT_REJECTED,
                     )
-                seen = self.cursor(sender)
-                unseen = [m for m in msgs if m.seq > seen and m.sender != sender]
+                unseen = self.unseen(sender, msgs)
                 if unseen:
                     raise ChatError(
                         f"{len(unseen)} new message(s) arrived since you last read, so your reply "
@@ -608,12 +676,19 @@ class Room:
                 atts.append(Attachment(sha, fname, len(data), ctype))
             if atts:
                 meta["attachments"] = json.dumps([a.to_meta() for a in atts], ensure_ascii=False)
-            final = self.msgs_dir / f"{seq:06d}-{sender}.md"
+            if cfg.format >= 2:
+                # A random suffix: two machines that pick the same seq never overwrite each other, and a
+                # declared size lets readers skip a file that is still arriving.
+                final = self.msgs_dir / f"{seq:06d}-{sender}.{secrets.token_hex(3)}.md"
+                meta["bytes"] = len((body + "\n").encode("utf-8"))
+            else:
+                final = self.msgs_dir / f"{seq:06d}-{sender}.md"
             atomic_write(final, dump_doc(meta, body + "\n"))
-            msg = Message(seq=seq, sender=sender, ts=str(meta["ts"]), end=kind, body=body, attachments=tuple(atts))
+            msg = Message(seq=seq, sender=sender, ts=str(meta["ts"]), end=kind, body=body, attachments=tuple(atts),
+                          id=final.name[:-3], arrived=time.time())
             self._cache[final.name] = msg
         if sender != HUMAN:
-            self.set_cursor(sender, seq)
+            self.mark_seen(sender, msgs)   # replying means having read what was there
         return msg
 
 
@@ -864,6 +939,8 @@ class Delivery:
     messages: Tuple[Message, ...]
     status: Status
     empty_room: bool
+    snapshot: Tuple[Message, ...] = ()   # everything the agent was shown about: marked seen once delivered
+    syncing: Optional[int] = None        # a message still syncing (synced folders), if that's what we waited on
 
 
 def await_turn(
@@ -880,12 +957,12 @@ def await_turn(
     while True:
         msgs = room.messages()
         st = room.status(msgs)
-        if st.closed or st.next_speaker == me:
-            seen = room.cursor(me)
-            unseen = tuple(m for m in msgs if m.seq > seen and m.sender != me)
-            return Delivery("closed" if st.closed else "your_turn", unseen, st, not msgs)
+        gap = room.sync_gap(msgs)   # a message still syncing: don't act on a partial view
+        if gap is None and (st.closed or st.next_speaker == me):
+            unseen = tuple(room.unseen(me, msgs))
+            return Delivery("closed" if st.closed else "your_turn", unseen, st, not msgs, tuple(msgs))
         if time.monotonic() >= deadline or (cancelled is not None and cancelled()):
-            return Delivery("timeout", (), st, False)
+            return Delivery("timeout", (), st, False, syncing=gap)
         if on_tick is not None:
             on_tick(st)
         time.sleep(POLL_INTERVAL)
@@ -906,9 +983,8 @@ def render_delivery(d: Delivery, room: "Room", hints: Hints, timeout: Optional[f
             parts.append(proposal_line(st, hints))
         parts.append(f"STATUS: YOUR_TURN — turn {st.turns + 1} of {cfg.max_turns}. {hints.send()}")
     else:
-        parts.append(
-            f"STATUS: TIMEOUT — not your turn yet ({st.next_speaker} is answering). This is normal. {hints.wait(timeout)}"
-        )
+        why = f"message #{d.syncing} is still syncing" if d.syncing is not None else f"{st.next_speaker} is answering"
+        parts.append(f"STATUS: TIMEOUT — not your turn yet ({why}). This is normal. {hints.wait(timeout)}")
     return "\n".join(parts)
 
 
@@ -1045,7 +1121,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
     out(render_delivery(d, room, CliHints(root, room.name, me), args.timeout))
     if d.state == "timeout":
         return EXIT_TIMEOUT
-    room.set_cursor(me, d.status.last_seq)  # only after printing: at-least-once delivery
+    room.mark_seen(me, d.snapshot)  # only after printing: at-least-once delivery
     return EXIT_CLOSED if d.state == "closed" else EXIT_OK
 
 
@@ -1083,10 +1159,9 @@ def cmd_read(args: argparse.Namespace) -> int:
         out(transcript_header(room), *[fmt_message(m, room, hints) for m in shown], f"Room: {summary(cfg, st)}")
         return EXIT_OK
     me = room.require_participant(args.who)
-    seen = room.cursor(me)
-    shown = [m for m in msgs if m.seq > seen and m.sender != me]
+    shown = room.unseen(me, msgs)
     out(render_read(shown, room, st, me, CliHints(root, room.name, me)))
-    room.set_cursor(me, st.last_seq)
+    room.mark_seen(me, msgs)
     return EXIT_CLOSED if st.closed else EXIT_OK
 
 
@@ -1195,6 +1270,7 @@ def room_json(room: Room, after: int = 0) -> Dict[str, object]:
             "closed": st.closed,
             "last_seq": st.last_seq,
             "end_proposed_by": list(st.end_proposed_by),
+            "count": len(msgs),   # lets viewers notice a late message that reused an old seq
         },
         "messages": [message_json(room, m) for m in msgs if m.seq > after],
     }
@@ -1483,7 +1559,7 @@ def cmd_bridge(args: argparse.Namespace) -> int:
             timeout=args.request_timeout,
         )
         reply = clean_reply(raw, me, others, cfg.max_chars) or "(no reply)"
-        room.set_cursor(me, st.last_seq)  # everything in the prompt counts as read
+        room.mark_seen(me, msgs)  # everything in the prompt counts as read
         try:
             msg = room.publish(me, reply)
         except ChatError as e:
@@ -1923,7 +1999,7 @@ class McpServer:
         text = render_delivery(d, room, self.hints, timeout)
         if d.state == "timeout":
             return text, None
-        return text, lambda: room.set_cursor(me, d.status.last_seq)
+        return text, lambda: room.mark_seen(me, d.snapshot)
 
     def _tool_send(self, args: Dict[str, Any], **_: Any) -> Reply:
         room, me = self._session(args)
@@ -1982,9 +2058,8 @@ class McpServer:
         if parse_bool(_arg(args, "all"), "all"):
             text = "\n".join([transcript_header(room), *[fmt_message(m, room, self.hints) for m in msgs], turn_line(cfg, st, me, self.hints)])
         else:
-            seen = room.cursor(me)
-            text = render_read([m for m in msgs if m.seq > seen and m.sender != me], room, st, me, self.hints)
-        return text, lambda: room.set_cursor(me, st.last_seq)
+            text = render_read(room.unseen(me, msgs), room, st, me, self.hints)
+        return text, lambda: room.mark_seen(me, msgs)
 
 
 def cmd_mcp(args: argparse.Namespace) -> int:

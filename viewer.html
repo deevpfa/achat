@@ -91,7 +91,7 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
-const state = { room: null, data: null, lastSeq: 0, polling: false, sending: false };
+const state = { room: null, data: null, lastSeq: 0, rendered: 0, polling: false, sending: false };
 
 async function api(path, opts = {}) {
   const res = await fetch(path, { ...opts, headers: { "X-Achat": "1", "Content-Type": "application/json", ...(opts.headers || {}) } });
@@ -197,13 +197,20 @@ async function poll() {
   state.polling = true;
   const room = state.room;
   try {
-    const d = await api(`/api/rooms/${encodeURIComponent(room)}?after=${state.lastSeq}`);
+    let d = await api(`/api/rooms/${encodeURIComponent(room)}?after=${state.lastSeq}`);
     if (room !== state.room) return;
+    const freshCount = d.messages.filter((m) => m.seq > state.lastSeq).length;
+    if (d.status.count != null && d.status.count !== state.rendered + freshCount) {
+      // a message landed late with an already-shown seq (synced folders): rebuild the transcript
+      d = await api(`/api/rooms/${encodeURIComponent(room)}?after=0`);
+      if (room !== state.room) return;
+      $("stream").replaceChildren(); state.lastSeq = 0; state.rendered = 0;
+    }
     const changed = !state.data || JSON.stringify(d.status) !== JSON.stringify(state.data.status);
     state.data = d;
     if (changed) renderHead();
     const fresh = d.messages.filter((m) => m.seq > state.lastSeq);
-    if (fresh.length) { appendMessages(fresh); state.lastSeq = fresh[fresh.length - 1].seq; }
+    if (fresh.length) { appendMessages(fresh); state.lastSeq = fresh[fresh.length - 1].seq; state.rendered += fresh.length; }
     if (!state.lastSeq && !$("stream").children.length) {
       $("stream").append(el("div", "empty", "Sala vacía. Esperando que " + d.participants[0] + " abra la conversación…"));
       $("stream").lastChild.id = "empty";
@@ -225,7 +232,7 @@ async function poll() {
 function openRoom() {
   const name = decodeURIComponent(location.hash.slice(1));
   if (!name || name === state.room) return;
-  Object.assign(state, { room: name, data: null, lastSeq: 0 });
+  Object.assign(state, { room: name, data: null, lastSeq: 0, rendered: 0 });
   $("stream").replaceChildren(); $("err").textContent = "";
   poll(); loadRooms();
 }

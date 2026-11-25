@@ -8,6 +8,8 @@ export interface RoomStatus {
   last_seq: number;
   /** Agents currently proposing to end (achat ≥ 0.3). */
   end_proposed_by: string[];
+  /** Total messages (achat ≥ 0.4): a mismatch means a late message reused an old seq. */
+  count?: number;
 }
 
 export interface AttachmentInfo {
@@ -81,6 +83,7 @@ function parseStatus(v: unknown): RoomStatus {
     closed: need(s.closed === null || typeof s.closed === "string", "status.closed", s.closed as string | null),
     last_seq: need(typeof s.last_seq === "number", "status.last_seq", s.last_seq as number),
     end_proposed_by: Array.isArray(s.end_proposed_by) ? s.end_proposed_by.filter((x): x is string => typeof x === "string") : [],
+    count: typeof s.count === "number" ? s.count : undefined,
   };
 }
 

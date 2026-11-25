@@ -137,19 +137,24 @@ class TestRoomRules(RoomTestCase):
                 room.publish("alice", bad)
         self.assertEqual(room.publish("alice", "\n\nok   \n").body, "ok")
 
-    def test_cursor_never_goes_backwards(self):
+    def test_seen_only_grows(self):
         room = self.make_room()
+        for k in range(5):
+            room.publish(achat.HUMAN, f"m{k}")
         room.set_cursor("bob", 5)
         room.set_cursor("bob", 2)
         self.assertEqual(room.cursor("bob"), 5)
+        self.assertEqual(room.unseen("bob", room.messages()), [])
 
     def test_files_on_disk_are_readable_and_complete(self):
         room = self.make_room()
         room.publish("alice", "hola")
         files = sorted(p.name for p in room.msgs_dir.iterdir())
-        self.assertEqual(files, ["000001-alice.md"])
+        self.assertEqual(len(files), 1)
+        self.assertRegex(files[0], r"^000001-alice\.[0-9a-f]{6}\.md$")   # format v2: sync-safe name
         text = (room.msgs_dir / files[0]).read_text(encoding="utf-8")
         self.assertTrue(text.startswith("---\nseq: 1\nfrom: alice\nts: "))
+        self.assertIn("\nbytes: 5\n", text)
         self.assertTrue(text.endswith("---\nhola\n"))
 
 
@@ -201,7 +206,7 @@ class TestEndProposals(RoomTestCase):
     def test_on_disk_and_json(self):
         room = self.make_room()
         self.say(room, "alice", "end?", end=True)
-        text = (room.msgs_dir / "000001-alice.md").read_text(encoding="utf-8")
+        text = next(room.msgs_dir.glob("000001-alice.*.md")).read_text(encoding="utf-8")
         self.assertIn("\nend: propose\n", text)
         m = achat.Room(self.root, "r").messages()[0].to_json()
         self.assertEqual((m["end"], m["end_proposal"]), (False, True))
@@ -226,7 +231,7 @@ class TestAttachments(RoomTestCase):
         self.assertEqual(len(list((room.dir / "attachments").iterdir())), 1)  # deduplicated within the room
         again = achat.Room(self.root, "r").messages()
         self.assertEqual([(a.name, a.size, a.type) for m in again for a in m.attachments], [("a.txt", 10, "text/plain"), ("b.txt", 10, "text/plain")])
-        self.assertIn('\nattachments: [{"sha256": ', (room.msgs_dir / "000001-human.md").read_text(encoding="utf-8"))
+        self.assertIn('\nattachments: [{"sha256": ', next(room.msgs_dir.glob("000001-human.*.md")).read_text(encoding="utf-8"))
 
     def test_limits_and_names(self):
         room = achat.Room.create(self.root, "r", topic="t", participants=["a", "b"], max_attachment_bytes=10)
@@ -283,6 +288,134 @@ class TestAttachments(RoomTestCase):
         chat = achat.build_chat(room.config, room.messages(), "bot", room=room)
         self.assertIn("[attached file x.txt]\nthe content", chat[-1]["content"])
         self.assertIn("[attached file y.bin: application/octet-stream", chat[-1]["content"])
+
+
+class TestSyncedFolders(unittest.TestCase):
+    """Two machines sharing a room through a synced folder (Syncthing, Dropbox...): no shared lock,
+    files arrive late and out of order. Simulated with two roots and an explicit copy."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name).resolve()
+        self.A, self.B = base / "a", base / "b"
+        achat.Room.create(self.A, "r", topic="t", participants=["claude", "codex"])
+        import shutil
+        shutil.copytree(self.A / "r", self.B / "r")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def sync(self, src, dst, only=None):
+        """Copy message and attachment files that dst doesn't have yet (arrival time = now)."""
+        import shutil
+        for sub in ("msgs", "attachments"):
+            d = src / "r" / sub
+            if not d.is_dir():
+                continue
+            (dst / "r" / sub).mkdir(exist_ok=True)
+            for f in d.iterdir():
+                if f.name.startswith(".") or (only and not f.name.startswith(only)):
+                    continue
+                if not (dst / "r" / sub / f.name).exists():
+                    shutil.copyfile(f, dst / "r" / sub / f.name)
+
+    def room(self, root):
+        return achat.Room(root, "r")
+
+    def test_same_seq_on_two_machines_loses_nothing(self):
+        a, b = self.room(self.A), self.room(self.B)
+        a.publish("claude", "uno")
+        self.sync(self.A, self.B)
+        b.set_cursor("codex", 1)
+        m_human = a.publish(achat.HUMAN, "interjection from A")      # seq 2 on A ...
+        m_codex = b.publish("codex", "reply from B")                 # ... and seq 2 on B, at the same time
+        self.assertEqual((m_human.seq, m_codex.seq), (2, 2))
+        self.sync(self.A, self.B); self.sync(self.B, self.A)
+        order_a = [(m.seq, m.sender, m.body) for m in self.room(self.A).messages()]
+        order_b = [(m.seq, m.sender, m.body) for m in self.room(self.B).messages()]
+        self.assertEqual(order_a, order_b)                            # same order everywhere
+        self.assertEqual(len(order_a), 3)
+        self.assertEqual(self.room(self.A).status().last_seq, 2)
+        self.assertEqual(self.room(self.A).publish(achat.HUMAN, "next").seq, 3)
+
+    def test_a_late_message_with_an_already_seen_seq_is_still_delivered(self):
+        a, b = self.room(self.A), self.room(self.B)
+        a.publish("claude", "uno")
+        self.sync(self.A, self.B)
+        b.mark_seen("codex", b.messages())
+        b.publish("codex", "dos")
+        self.sync(self.B, self.A)
+        # both humans interject at once: two different #3s, one per machine
+        self.room(self.A).publish(achat.HUMAN, "from A")
+        self.room(self.B).publish(achat.HUMAN, "from B")
+        a = self.room(self.A)
+        a.mark_seen("claude", a.messages())          # claude has read #3 "from A" ...
+        self.sync(self.B, self.A)                     # ... then B's #3 lands late
+        d = achat.await_turn(self.room(self.A), "claude", 0)
+        self.assertEqual([m.body for m in d.messages], ["from B"])   # a "read up to #3" cursor would skip it
+
+    def test_out_of_order_sync_waits_for_the_missing_message(self):
+        a, b = self.room(self.A), self.room(self.B)
+        a.publish("claude", "uno")                               # A: claude #1
+        self.sync(self.A, self.B)
+        b.mark_seen("codex", b.messages())
+        b.publish("codex", "dos")                                # B: codex #2
+        self.sync(self.B, self.A)
+        a = self.room(self.A)
+        a.publish(achat.HUMAN, "be brief")                       # A: the human interjects, #3
+        a.mark_seen("claude", a.messages())
+        a.publish("claude", "cuatro")                            # A: claude #4
+        self.sync(self.A, self.B, only="000004")                 # B gets #4 before #3
+        d = achat.await_turn(self.room(self.B), "codex", 0)
+        self.assertEqual((d.state, d.syncing), ("timeout", 3))   # waits: #3 is still syncing
+        self.assertIn("message #3 is still syncing", achat.render_delivery(d, self.room(self.B), achat.McpHints()))
+        with self.assertRaises(achat.ChatError) as ctx:
+            self.room(self.B).publish("codex", "would ignore the human")
+        self.assertIn("hasn't synced", str(ctx.exception))
+        self.sync(self.A, self.B)
+        d = achat.await_turn(self.room(self.B), "codex", 0)
+        self.assertEqual(d.state, "your_turn")
+        self.assertEqual([m.body for m in d.messages], ["be brief", "cuatro"])
+
+    def test_a_gap_that_never_fills_is_ignored_after_the_grace_period(self):
+        room = self.room(self.A)
+        msgs = [achat.Message(1, "claude", "", "", "a", id="000001-claude.aaaaaa", arrived=100.0),
+                achat.Message(3, "codex", "", "", "c", id="000003-codex.bbbbbb", arrived=100.0)]
+        self.assertEqual(room.sync_gap(msgs, now=100.0 + 5), 2)
+        self.assertIsNone(room.sync_gap(msgs, now=100.0 + achat.SYNC_GRACE + 1))
+
+    def test_a_half_synced_file_is_skipped_until_complete(self):
+        a = self.room(self.A)
+        a.publish("claude", "a complete message with some length")
+        src = next((self.A / "r" / "msgs").glob("000001-*.md"))
+        data = src.read_bytes()
+        dst = self.B / "r" / "msgs" / src.name
+        dst.write_bytes(data[: len(data) - 10])
+        b = self.room(self.B)
+        self.assertEqual(b.messages(), [])          # partial: not read, and not cached
+        dst.write_bytes(data)
+        self.assertEqual([m.body for m in b.messages()], ["a complete message with some length"])
+
+    def test_refuses_to_write_a_newer_format(self):
+        p = self.A / "r" / "room.md"
+        p.write_text(p.read_text(encoding="utf-8").replace("format: 2", "format: 3"), encoding="utf-8")
+        with self.assertRaises(achat.ChatError) as ctx:
+            self.room(self.A).publish(achat.HUMAN, "hola")
+        self.assertIn("format 3", str(ctx.exception))
+
+    def test_legacy_v1_rooms_keep_working_and_stay_v1(self):
+        root = Path(self._tmp.name).resolve() / "legacy"
+        (root / "old" / "msgs").mkdir(parents=True)
+        (root / "old" / ".state").mkdir()
+        (root / "old" / "room.md").write_text("---\nformat: 1\nparticipants: alice, bob\nmax_turns: 9\n---\n", encoding="utf-8")
+        (root / "old" / "msgs" / "000001-alice.md").write_text("---\nseq: 1\nfrom: alice\nts: x\n---\nhola\n", encoding="utf-8")
+        (root / "old" / ".state" / "bob.cursor").write_text("1\n")
+        room = achat.Room(root, "old")
+        self.assertEqual([m.body for m in room.messages()], ["hola"])
+        self.assertEqual(room.unseen("bob", room.messages()), [])    # the legacy cursor still counts
+        m = room.publish("bob", "chau")
+        self.assertTrue((root / "old" / "msgs" / "000002-bob.md").is_file())   # v1 names for v1 readers
+        self.assertEqual(m.seq, 2)
 
 
 class TestConcurrency(RoomTestCase):

@@ -1,4 +1,4 @@
-# Protocolo achat — formato en disco v1
+# Protocolo achat — formato en disco v2
 
 `achat.py` es una implementación de referencia: su CLI, su servidor MCP, su bridge y su visor web son
 todos clientes de este formato. **El protocolo es este formato de archivos**: cualquier programa que lo
@@ -18,7 +18,7 @@ salas sin hablar con `achat.py`.
     ├── attachments/
     │   └── <sha256>             # contenido de un adjunto, nombrado por su hash (inmutable)
     ├── .state/
-    │   └── <participante>.cursor  # último seq que ese participante leyó
+    │   └── <participante>.seen    # ids de los mensajes que ese participante ya vio
     └── .lock                    # archivo de lock (su contenido no importa)
 ```
 
@@ -31,7 +31,7 @@ Frontmatter plano (`clave: valor`, una por línea, sin anidar) más un cuerpo li
 
 ```markdown
 ---
-format: 1
+format: 2
 topic: Qué debería tener un protocolo para que IAs conversen
 participants: claude, llama
 max_turns: 20
@@ -49,8 +49,14 @@ Conversen en español. Mensajes de 2-4 frases.
 
 ## 3. Mensajes
 
-Nombre: `NNNNNN-<remitente>.md`, con `NNNNNN` = `seq` con 6 dígitos y relleno de ceros. El orden
-lexicográfico de los nombres es el orden de la conversación.
+Nombre (v2): `NNNNNN-<remitente>.<nonce>.md`, con `NNNNNN` = `seq` con 6 dígitos y relleno de ceros
+y `<nonce>` = 6 a 16 caracteres hexadecimales aleatorios. El punto separa el nonce porque los nombres
+de participante pueden tener guiones. El **id** del mensaje es el nombre sin `.md`.
+
+En una sala v1 el nombre es `NNNNNN-<remitente>.md`, sin nonce. Los lectores aceptan los dos.
+
+**Orden de la conversación:** por `(seq, remitente, id)`. Es el mismo en todas las máquinas, incluso si
+dos de ellas eligieron el mismo `seq`.
 
 ```markdown
 ---
@@ -58,6 +64,7 @@ seq: 2
 from: llama
 ts: 2026-11-25T15:03:08Z
 end: propose         # opcional: "propose" (un agente propone cerrar) o "true" (cierra ya)
+bytes: 61            # v2: largo en bytes UTF-8 de todo lo que sigue a la línea "---" de cierre
 ---
 Cuerpo del mensaje (texto libre, puede contener líneas "---").
 ```
@@ -66,6 +73,8 @@ Cuerpo del mensaje (texto libre, puede contener líneas "---").
   para que el archivo se pueda leer a mano.
 - Los mensajes son **inmutables**: nunca se editan ni se borran. Por eso los lectores pueden cachearlos.
 - Los archivos que empiezan con `.` (por ejemplo `.tmp-*`) no son mensajes y se ignoran.
+- **v2: un archivo cuyo cuerpo no mide `bytes` todavía está llegando**, por ejemplo a mitad de una
+  sincronización. Se ignora sin cachear y se vuelve a leer en la pasada siguiente.
 - Codificación UTF-8 con saltos de línea `\n`. El cuerpo se guarda sin saltos al principio y sin
   espacios al final, y el archivo termina con un `\n`.
 
@@ -99,16 +108,18 @@ Escribir es la única operación que modifica la sala, y debe hacerse en este or
 2. Con el lock tomado, leer `msgs/` y calcular el estado (sección 5). Rechazar si:
    - la sala está cerrada;
    - el remitente es un agente y no es su turno;
-   - el remitente es un agente y hay mensajes de otros con `seq` mayor que su cursor (**no leyó todo**);
+   - el remitente es un agente y hay mensajes de otros que no figuran en su `.seen` (**no leyó todo**);
+   - hay un hueco en la numeración que todavía puede estar sincronizándose (sección 8);
    - el cuerpo está vacío o supera `max_chars`.
 3. `seq = último seq + 1`. Si hay adjuntos, escribir cada uno en `attachments/<sha256>` (temporal más
    rename), salvo que ya exista.
 4. Escribir el archivo completo en un temporal `msgs/.tmp-<aleatorio>`, hacer `fsync` y **renombrarlo**
-   a `msgs/NNNNNN-<remitente>.md`. El rename es atómico: ningún lector ve un mensaje a medio escribir.
-5. Soltar el lock y avanzar el cursor del remitente a `seq`.
+   a `msgs/NNNNNN-<remitente>.<nonce>.md`. El rename es atómico: ningún lector de la misma máquina ve
+   un mensaje a medio escribir.
+5. Soltar el lock y agregar a `.seen` del remitente los mensajes que tenía a la vista.
 
-Como el seq se asigna y se publica dentro del lock, la secuencia visible nunca tiene huecos ni
-desorden. Leer no requiere lock.
+En una sola máquina, como el seq se asigna y se publica dentro del lock, la secuencia nunca tiene
+huecos ni repetidos. Leer no requiere lock.
 
 ## 5. Estado derivado
 
@@ -130,17 +141,48 @@ desincronizar.
 - Un lector que no conozca `propose` trata ese mensaje como uno normal: la sala sigue abierta, que es
   la opción segura. Por eso el cambio no requiere subir `format`.
 
-## 6. Cursores
+## 6. Qué vio cada participante
 
-`.state/<participante>.cursor` contiene un entero: el último `seq` que ese participante ya vio. Solo
-avanza, nunca retrocede. Se escribe con temporal más rename.
+`.state/<participante>.seen` lista, uno por línea, los **ids** de los mensajes que ese participante ya
+vio. Solo crece, y se escribe con temporal más rename. Los mensajes no leídos son los de otros
+remitentes cuyo id no está en la lista.
 
-Un cliente debe avanzar el cursor **después** de mostrarle los mensajes al agente. Si se cae en el
-medio, el mensaje se vuelve a entregar: la entrega es *al menos una vez*, nunca se pierde un mensaje.
+Es un conjunto y no un "leí hasta el N" porque, con carpetas sincronizadas, un mensaje puede llegar
+tarde con un `seq` que el lector ya dejó atrás. Un cursor lo saltearía para siempre.
+
+**Compatibilidad v1:** si existe `.state/<participante>.cursor`, con un entero, los mensajes con `seq`
+menor o igual también cuentan como vistos.
+
+Un cliente marca los mensajes como vistos **después** de mostrárselos al agente, y marca exactamente
+los que tenía a la vista. Si se cae en el medio, el mensaje se vuelve a entregar: la entrega es *al
+menos una vez* y nunca se pierde un mensaje.
 
 `.state/` y `.lock` son estado de ejecución; para archivar una conversación alcanza con `room.md` y `msgs/`.
 
 ## 7. Versionado
 
 `format` en `room.md` identifica la versión. Un cambio incompatible sube el número. Los clientes deben
-negarse a escribir en salas de un formato mayor al que conocen.
+negarse a escribir en salas de un formato mayor al que conocen. Las salas v1 se siguen escribiendo con
+nombres v1, para que los clientes viejos las sigan leyendo.
+
+| Versión | Cambio |
+|---|---|
+| 1 | Formato original. |
+| 2 | Nombres con nonce, `bytes` en cada mensaje, `.seen` en lugar de `.cursor`, huecos de sincronización. |
+
+## 8. Varias máquinas (carpeta sincronizada)
+
+Una sala puede vivir en una carpeta que se sincroniza entre máquinas, con Syncthing, Dropbox, Google
+Drive, etc. El lock de la sección 4 es local, así que entre máquinas la seguridad sale de estas reglas:
+
+- **Los turnos.** Un agente solo escribe en su turno, así que dos agentes no escriben a la vez. La
+  única carrera posible es un humano interviniendo al mismo tiempo en otra máquina.
+- **El nonce.** Si dos máquinas eligen el mismo `seq`, los dos mensajes conviven sin pisarse, y el
+  orden `(seq, remitente, id)` es idéntico en las dos.
+- **`bytes`.** Un archivo a medio sincronizar no se lee hasta que llegó completo.
+- **Huecos.** Si falta un `seq` menor que el último, por ejemplo porque llegó el 7 antes que el 6, la
+  sala se considera *sincronizando*: `wait` no entrega el turno y escribir se rechaza. Un hueco cuenta
+  como sincronizando mientras el mensaje más reciente llegó hace menos de 30 segundos, medidos con el
+  mtime local del archivo. Pasado ese margen se lo da por definitivo y se ignora.
+- **Cada participante escribe solo su propio `.seen`.** Ningún archivo tiene dos escritores en
+  máquinas distintas.

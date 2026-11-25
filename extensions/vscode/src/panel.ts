@@ -47,6 +47,7 @@ function parseFromWebview(m: unknown): FromWebview | undefined {
 
 export class ConversationPanel implements vscode.Disposable {
   private lastSeq = 0;
+  private shown = 0;   // messages sent to the webview so far
   /** How many messages the webview reports on screen (proves the UI script really runs). */
   rendered = -1;
   readonly webviewErrors: string[] = [];
@@ -120,18 +121,24 @@ export class ConversationPanel implements vscode.Disposable {
       do {
         this.dirty = false;
         try {
-          const after = this.forceReset ? 0 : this.lastSeq;
+          let after = this.forceReset ? 0 : this.lastSeq;
           this.forceReset = false;
-          const detail = await this.state.requireCli().room(this.room, after);
+          let detail = await this.state.requireCli().room(this.room, after);
+          if (after > 0 && detail.status.count != null && detail.status.count !== this.shown + detail.messages.length) {
+            after = 0;   // a late message reused an old seq (synced folders): send the whole transcript again
+            detail = await this.state.requireCli().room(this.room, 0);
+          }
           const reset = after === 0;
           if (reset) {
             this.lastSeq = 0;
+            this.shown = 0;
           }
           this.onboarding = detail.onboarding;
           const { messages, ...meta } = detail;
           await this.panel.webview.postMessage({ type: "update", reset, room: meta, messages });
           if (messages.length) {
             this.lastSeq = messages[messages.length - 1].seq;
+            this.shown += messages.length;
           }
         } catch (e) {
           await this.panel.webview.postMessage({ type: "error", message: e instanceof Error ? e.message : String(e) });
