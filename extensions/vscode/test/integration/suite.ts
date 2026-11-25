@@ -37,7 +37,8 @@ export async function run(): Promise<void> {
     (report.passed as string[] | undefined) ? (report.passed as string[]).push(name) : (report.passed = [name]);
   };
   try {
-    const ext = vscode.extensions.all.find((e) => e.packageJSON?.name === "achat" && e.packageJSON?.publisher === "achat");
+    // by name only: the publisher id is whatever the Marketplace/Open VSX account is (see RELEASING.md)
+    const ext = vscode.extensions.all.find((e) => e.packageJSON?.name === "achat" && e.extensionPath.includes("extensions/vscode"));
     assert.ok(ext, "extension is loaded");
     const api = (await ext.activate()) as AchatApi;
 
