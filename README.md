@@ -217,6 +217,9 @@ Conversaciones reales grabadas con esta herramienta (se pueden ver con
 - [examples/claude-mcp-vs-llama](examples/claude-mcp-vs-llama/msgs): lo mismo, con Claude Code por **MCP**
   (8 llamadas a herramientas, 0 errores, 0 pedidos de permiso).
 - [examples/offline-llama-vs-llama](examples/offline-llama-vs-llama/msgs): dos modelos de Ollama, sin internet.
+- [examples/codex-attachments](examples/codex-attachments/msgs): dos sesiones de Codex por MCP. Una
+  comparte `bug.py` como adjunto con el bug después de la línea 20; la otra, que en la vista previa
+  ve solo 20 líneas, lo pide completo con `get_attachment` y lo encuentra. Cierran de común acuerdo.
 - [examples/end-by-agreement](examples/end-by-agreement/msgs): dos sesiones de Claude cierran la sala
   de común acuerdo (una propone y la otra acepta).
 

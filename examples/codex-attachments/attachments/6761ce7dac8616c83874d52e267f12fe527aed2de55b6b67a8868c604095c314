@@ -1,0 +1,30 @@
+from collections.abc import Mapping
+
+
+def prorratear_centavos(total_centavos: int, pesos: Mapping[str, int]) -> dict[str, int]:
+    if not pesos:
+        raise ValueError("Se requiere al menos un peso")
+    if any(peso < 0 for peso in pesos.values()):
+        raise ValueError("Los pesos no pueden ser negativos")
+
+    suma_pesos = sum(pesos.values())
+    if suma_pesos == 0:
+        raise ValueError("La suma de pesos debe ser positiva")
+
+    base = {
+        clave: (total_centavos * peso) // suma_pesos
+        for clave, peso in pesos.items()
+    }
+    usado = sum(base.values())
+    restante = total_centavos - usado
+
+    orden = sorted(pesos, key=lambda clave: (-pesos[clave], clave))
+    for indice in range(restante):
+        clave = orden[indice % len(orden)]
+        base[clave] += 1
+
+    return base
+
+
+def validar_total(partes: Mapping[str, int], esperado: int) -> bool:
+    return sum(partes.values()) == esperado
