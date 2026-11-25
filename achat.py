@@ -25,6 +25,7 @@ import re
 import queue
 import secrets
 import shlex
+import shutil
 import sys
 import textwrap
 import threading
@@ -1420,9 +1421,7 @@ def make_server(root: Path, host: str = "127.0.0.1", port: int = DEFAULT_PORT) -
 
 def cmd_serve(args: argparse.Namespace) -> int:
     root = resolve_root(args.dir)
-    host = tailscale_ip() if args.host == "tailscale" else args.host
-    if not host:
-        raise ChatError("couldn't get this machine's Tailscale address (`tailscale ip -4`). Is Tailscale running?")
+    host = need_tailscale_ip() if args.host == "tailscale" else args.host
     server = make_server(root, host=host, port=args.port)
     port = server.server_address[1]
     url = f"http://127.0.0.1:{port}/"
@@ -1483,12 +1482,58 @@ def is_private_net(addr: str) -> bool:
     return ip.is_loopback or ip.is_private
 
 
-def tailscale_ip() -> Optional[str]:
+TS_APP_MAC = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+TS_DOWNLOAD = {"darwin": "https://tailscale.com/download/mac", "win32": "https://tailscale.com/download/windows"}.get(
+    sys.platform, "https://tailscale.com/download/linux")
+
+
+def tailscale_bin() -> Optional[str]:
+    forced = os.environ.get("ACHAT_TAILSCALE")   # tests (and unusual installs) point at a specific binary
+    if forced is not None:
+        return forced if os.path.exists(forced) else None
+    return shutil.which("tailscale") or (TS_APP_MAC if sys.platform == "darwin" and os.path.exists(TS_APP_MAC) else None)
+
+
+def tailscale_state() -> Tuple[str, Optional[str]]:
+    """("missing" | "not-running" | "needs-login" | "stopped" | "running", this machine's Tailscale IPv4).
+    Detection only: achat never installs or starts Tailscale itself."""
+    b = tailscale_bin()
+    if not b:
+        return "missing", None
     try:
-        out_ = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=10).stdout.split()
-        return out_[0] if out_ else None
-    except (OSError, subprocess.SubprocessError):
-        return None
+        r = subprocess.run([b, "status", "--json"], capture_output=True, text=True, timeout=10)
+        st = json.loads(r.stdout) if r.stdout.strip() else {}
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return "not-running", None
+    backend = st.get("BackendState", "")
+    if backend == "NeedsLogin":
+        return "needs-login", None
+    if backend == "Stopped":
+        return "stopped", None
+    if backend != "Running":
+        return "not-running", None
+    ips = st.get("TailscaleIPs") or (st.get("Self") or {}).get("TailscaleIPs") or []
+    return "running", next((ip for ip in ips if "." in ip), None)
+
+
+def tailscale_hint(state: str) -> str:
+    return {
+        "missing": f"Tailscale isn't installed. It's free for personal use: {TS_DOWNLOAD} (your friend installs it too).",
+        "not-running": "Tailscale is installed but not running: open the Tailscale app (on Linux: `sudo tailscale up`).",
+        "needs-login": "Tailscale is running but you're not signed in: open the app and log in (or run `tailscale up`).",
+        "stopped": "Tailscale is switched off: turn it on in the app (or run `tailscale up`).",
+    }.get(state, "")
+
+
+def tailscale_ip() -> Optional[str]:
+    return tailscale_state()[1]
+
+
+def need_tailscale_ip() -> str:
+    state, ip = tailscale_state()
+    if ip:
+        return ip
+    raise ChatError(tailscale_hint(state) or "Tailscale has no IPv4 address yet.",)
 
 
 def config_home() -> Path:
@@ -1802,10 +1847,11 @@ def cmd_invite(args: argparse.Namespace) -> int:
         return EXIT_OK
     url = args.url
     if not url:
-        ip = tailscale_ip()
-        if not ip:
-            raise ChatError("pass --url http://ADDRESS:PORT (the address your friend can reach, e.g. your Tailscale IP: `tailscale ip -4`)")
-        url = f"http://{ip}:{DEFAULT_PORT}"
+        try:
+            url = f"http://{need_tailscale_ip()}:{DEFAULT_PORT}"
+        except ChatError as e:
+            raise ChatError(f"{e} Or pass --url http://ADDRESS:PORT with an address your friend can reach "
+                            "(no Tailscale? see the shared-folder option in the README).") from None
     code = encode_invite(url, room.name, who, create_invite(room, who))
     out(
         f'Invite for "{who}" in room "{room.name}" at {url}',
@@ -1866,6 +1912,67 @@ def cmd_remote(args: argparse.Namespace) -> int:
         "Allow it only the achat tools: messages from the other side are written by someone else's AI.",
     )
     return EXIT_OK
+
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Checks what achat needs and what each optional feature needs. Never installs anything."""
+    OK, NO, OPT = "✓", "✗", "–"
+    lines, failed = [f"achat {VERSION} · {SCRIPT_PATH}", ""], False
+
+    lines.append("Required")
+    py = sys.version_info
+    if py >= (3, 8):
+        lines.append(f"  {OK} Python {py.major}.{py.minor}.{py.micro}")
+    else:
+        lines.append(f"  {NO} Python {py.major}.{py.minor}: achat needs 3.8 or newer"); failed = True
+    root = resolve_root(args.dir)
+    # a diagnosis changes nothing: check write access without creating the folder
+    existing = next(p_ for p_ in [root, *root.parents] if p_.exists())
+    if not os.access(existing, os.W_OK):
+        lines.append(f"  {NO} Rooms folder {root}: not writable. Choose another with --dir or ACHAT_DIR."); failed = True
+    elif root.is_dir():
+        lines.append(f"  {OK} Rooms folder {root} ({len(list_rooms(root))} rooms)")
+    else:
+        lines.append(f"  {OK} Rooms folder {root} (created with the first room)")
+
+    lines += ["", "Agents on this machine (any one is enough)"]
+    found_agent = False
+    for cmd, label in (("claude", "Claude Code"), ("codex", "Codex CLI"), ("gemini", "Gemini CLI")):
+        if shutil.which(cmd):
+            found_agent = True
+            lines.append(f"  {OK} {label}")
+        else:
+            lines.append(f"  {OPT} {label} not found")
+    lines.append(f"      MCP tools for an agent: claude mcp add --scope user achat -- {self_cmd()} mcp")
+    if not found_agent:
+        lines.append("      No agent CLI on PATH: any agent that runs shell commands or MCP servers works (Cursor, the IDE extensions...).")
+
+    lines += ["", "Local models (optional, for `achat bridge`)"]
+    try:
+        with urllib.request.urlopen("http://localhost:11434/api/tags", timeout=1.5) as r:
+            n = len(json.loads(r.read()).get("models", []))
+        lines.append(f"  {OK} Ollama running · {n} model(s)")
+    except (urllib.error.URLError, OSError, ValueError):
+        if shutil.which("ollama"):
+            lines.append(f"  {OPT} Ollama installed but not running: `ollama serve`")
+        else:
+            lines.append(f"  {OPT} Ollama not installed (any OpenAI-compatible server also works: --base-url)")
+
+    lines += ["", "Another machine (optional, for `achat invite` / `achat remote`)"]
+    state, ip = tailscale_state()
+    if state == "running" and ip:
+        lines.append(f"  {OK} Tailscale running · this machine is {ip}")
+    else:
+        lines.append(f"  {OPT} {tailscale_hint(state)}")
+        lines.append("      Without Tailscale: share the rooms folder with Syncthing/Dropbox instead (see the README).")
+    rd = remotes_dir()
+    remotes = sorted(p_.stem for p_ in rd.glob("*.json")) if rd.is_dir() else []
+    lines.append(f"  {OK if remotes else OPT} Remote rooms you joined: {', '.join(remotes) if remotes else 'none'}")
+
+    lines += ["", "STATUS: " + ("NOT READY — fix the ✗ above." if failed else "READY. Start with: " + cmd_hint(root, "new") + " my-room --participants a,b")]
+    out(*lines)
+    return EXIT_ERROR if failed else EXIT_OK
 
 
 # --------------------------------------------------------------------------
@@ -2637,6 +2744,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--url", help="address the guest reaches this machine at (default: your Tailscale IP, port 8765)")
     p.add_argument("--revoke", action="store_true", help="revoke this participant's invite")
     p.set_defaults(func=cmd_invite)
+
+    p = sub.add_parser("doctor", parents=[common], help="check what achat and each optional feature need (installs nothing)")
+    p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("remote", parents=[common], help="rooms hosted on other machines: add <invite> | list | remove NAME")
     p.add_argument("action", choices=["add", "list", "remove"])

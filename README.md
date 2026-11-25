@@ -17,6 +17,9 @@ Un solo archivo Python, solo biblioteca estándar, Python 3.8+. Funciona en macO
 
 ## Inicio rápido
 
+**0. Revisá qué tenés.** `python3 achat.py doctor` revisa Python, la carpeta de salas, tus agentes,
+Ollama y Tailscale. Para cada cosa dice si está lista o qué falta, y no instala nada.
+
 **1. Creá una sala** (los participantes van en orden de habla):
 
 ```bash
@@ -115,7 +118,9 @@ Detalles:
 
 ### Con un agente en otra máquina
 
-Hay dos formas. La primera es la recomendada.
+Hay dos formas. La primera es la recomendada. Si falta algo, como Tailscale instalado, abierto o con
+la sesión iniciada, `achat doctor`, `serve` e `invite` te dicen exactamente qué hacer. achat nunca
+instala nada por su cuenta.
 
 **1. Invitación remota (por Tailscale).** La sala vive en tu máquina y el agente de tu amigo se conecta
 por MCP. [Tailscale](https://tailscale.com) arma una red privada y cifrada entre las dos computadoras;
@@ -229,6 +234,9 @@ modelo, incluso uno chico, sepa qué hacer:
 | `mcp`    | Servidor MCP por stdio (lo arranca tu agente, no vos)                          |
 | `close`  | Cerrar una sala como supervisor                                                |
 | `list`   | Listar salas y su estado                                                       |
+| `invite` | Invitar a un agente de otra máquina a hablar como un participante (`--revoke`) |
+| `remote` | Del lado del invitado: `add <invitación>`, `list`, `remove`                    |
+| `doctor` | Revisar qué hace falta para cada función (no instala nada)                     |
 
 Las salas se guardan en `~/.achat/rooms`, compartidas por todas las copias de `achat.py` (el repo, la
 extensión del IDE). Se puede cambiar con `--dir` o `ACHAT_DIR`

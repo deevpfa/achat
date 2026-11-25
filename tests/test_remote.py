@@ -177,5 +177,79 @@ class TestRemoteConversation(RemoteCase):
         self.assertIn("No remotes yet", lst.stdout)
 
 
+class TestSetupChecks(unittest.TestCase):
+    """achat detects what's missing and says what to do; it never installs anything."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self._tmp.name).resolve()
+        self.env = {**os.environ, "ACHAT_TAILSCALE": str(self.base / "no-tailscale-here"), "ACHAT_HOME": str(self.base / "home")}
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True, encoding="utf-8",
+                              env=self.env, timeout=30)
+
+    @unittest.skipIf(os.name == "nt", "fake POSIX binary")
+    def test_tailscale_states(self):
+        fake = self.base / "tailscale"
+        cases = {
+            "not-running": ("echo 'failed to connect to local Tailscale daemon' >&2; exit 1", ("not-running", None)),
+            "needs-login": ("echo '{\"BackendState\": \"NeedsLogin\"}'", ("needs-login", None)),
+            "stopped": ("echo '{\"BackendState\": \"Stopped\"}'", ("stopped", None)),
+            "running": ("echo '{\"BackendState\": \"Running\", \"TailscaleIPs\": [\"100.101.102.103\", \"fd7a:115c:a1e0::1\"]}'",
+                        ("running", "100.101.102.103")),
+        }
+        old = os.environ.get("ACHAT_TAILSCALE")
+        try:
+            os.environ["ACHAT_TAILSCALE"] = str(self.base / "missing")
+            self.assertEqual(achat.tailscale_state(), ("missing", None))
+            os.environ["ACHAT_TAILSCALE"] = str(fake)
+            for name, (body, want) in cases.items():
+                fake.write_text("#!/bin/sh\n" + body + "\n"); fake.chmod(0o755)
+                self.assertEqual(achat.tailscale_state(), want, name)
+                if want[0] != "running":
+                    self.assertTrue(achat.tailscale_hint(want[0]))
+        finally:
+            if old is None:
+                os.environ.pop("ACHAT_TAILSCALE", None)
+            else:
+                os.environ["ACHAT_TAILSCALE"] = old
+
+    def test_serve_and_invite_explain_a_missing_tailscale(self):
+        r = self.run_cli("serve", "--host", "tailscale", "--port", "0", "--dir", str(self.base / "rooms"))
+        self.assertEqual(r.returncode, achat.EXIT_ERROR)
+        self.assertIn("isn't installed", r.stderr)
+        self.assertIn("tailscale.com/download", r.stderr)
+        achat.Room.create(self.base / "rooms", "charla", topic="t", participants=["a", "b"])
+        r = self.run_cli("invite", "--room", "charla", "--as", "b", "--dir", str(self.base / "rooms"))
+        self.assertEqual(r.returncode, achat.EXIT_ERROR)
+        self.assertIn("--url", r.stderr)
+        self.assertIn("shared-folder", r.stderr)
+
+    def test_doctor_reports_and_changes_nothing(self):
+        rooms = self.base / "not-created-yet" / "rooms"
+        r = self.run_cli("doctor", "--dir", str(rooms))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for text in ("✓ Python", "created with the first room", "Tailscale isn't installed", "STATUS: READY"):
+            self.assertIn(text, r.stdout)
+        self.assertFalse((self.base / "not-created-yet").exists())     # a diagnosis writes nothing
+        self.assertFalse((self.base / "home").exists())
+
+    @unittest.skipIf(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0), "POSIX permissions, non-root")
+    def test_doctor_flags_an_unwritable_rooms_folder(self):
+        locked = self.base / "locked"
+        locked.mkdir(); locked.chmod(0o500)
+        try:
+            r = self.run_cli("doctor", "--dir", str(locked / "rooms"))
+            self.assertEqual(r.returncode, achat.EXIT_ERROR)
+            self.assertIn("not writable", r.stdout)
+            self.assertIn("NOT READY", r.stdout)
+        finally:
+            locked.chmod(0o700)
+
+
 if __name__ == "__main__":
     unittest.main()
