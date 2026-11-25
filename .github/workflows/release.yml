@@ -33,13 +33,22 @@ jobs:
       - name: Tag must match the extension version
         run: test "v$(node -p 'require("./package.json").version')" = "${GITHUB_REF_NAME}"
       - run: npx vsce package --no-dependencies
+      # The GitHub release comes first: it exists even if a store rejects the upload.
+      - name: Attach the .vsix to a GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" *.vsix --title "${GITHUB_REF_NAME}" --generate-notes
       - name: Publish to the VS Code Marketplace (VS Code)
         if: env.VSCE_PAT != ''
         run: npx vsce publish --no-dependencies --packagePath *.vsix
       - name: Publish to Open VSX (Cursor, Windsurf, Antigravity, VSCodium)
         if: env.OVSX_PAT != ''
-        run: npx --yes ovsx publish *.vsix
-      - name: Attach the .vsix to a GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" *.vsix --title "${GITHUB_REF_NAME}" --generate-notes
+        run: |
+          PUB="$(node -p 'require("./package.json").publisher')"
+          # The first publication needs the namespace. "Already exists" is fine; any other
+          # failure (e.g. publisher agreement not signed) is shown and stops the job.
+          if ! out="$(npx --yes ovsx create-namespace "$PUB" 2>&1)"; then
+            echo "$out"
+            echo "$out" | grep -qi "already exists" || exit 1
+          fi
+          npx --yes ovsx publish *.vsix

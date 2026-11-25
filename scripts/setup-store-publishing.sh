@@ -44,7 +44,15 @@ else
 fi
 
 echo "2/5 Creating the Open VSX namespace '$PUB' (fine if it already exists)"
-run bash -c "cd '$EXT' && (npx --yes ovsx create-namespace '$PUB' || true)"
+if [[ $DRY == 1 ]]; then
+  echo "  [dry-run] npx ovsx create-namespace '$PUB'"
+elif ! out="$(cd "$EXT" && npx --yes ovsx create-namespace "$PUB" 2>&1)"; then
+  if ! echo "$out" | grep -qi "already exists"; then
+    echo "$out" >&2
+    echo "Could not create the Open VSX namespace. Did you sign the Publisher Agreement (log in with Eclipse) on open-vsx.org?" >&2
+    exit 1
+  fi
+fi
 
 echo "3/5 Storing the tokens as secrets of $GH_REPO"
 if [[ $DRY == 1 ]]; then
