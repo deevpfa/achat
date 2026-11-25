@@ -17,7 +17,7 @@ Lo único que requiere tu login es crear las cuentas y los tokens (pasos 1 y 2 d
 siguiente, en el navegador). Todo lo demás lo hace un solo comando:
 
 ```bash
-scripts/setup-store-publishing.sh            # pide el publisher ID y los dos tokens (sin mostrarlos)
+scripts/setup-store-publishing.sh            # pide el ID y los tokens sin mostrarlos; el del Marketplace es opcional
 scripts/setup-store-publishing.sh --dry-run  # muestra qué haría, sin cambiar nada
 ```
 
