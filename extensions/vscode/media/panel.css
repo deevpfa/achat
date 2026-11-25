@@ -49,6 +49,7 @@ details pre { white-space: pre-wrap; font-family: inherit; margin: 6px 0 0; }
 .who .from { color: var(--c); font-weight: 600; }
 .who .meta { color: var(--vscode-descriptionForeground); }
 .who .ended { margin-left: auto; color: var(--vscode-errorForeground); }
+.who .proposal { margin-left: auto; color: var(--vscode-descriptionForeground); }
 .body { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 4px; line-height: 1.5; }
 .empty { margin: auto; color: var(--vscode-descriptionForeground); }
 form { border-top: 1px solid var(--vscode-panel-border); padding: 10px 20px; display: grid; grid-template-columns: 1fr auto; gap: 6px 10px; }

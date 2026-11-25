@@ -51,6 +51,7 @@
   .msg .who span { color: var(--muted); font-weight: 400; }
   .msg .body { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 4px; line-height: 1.5; }
   .msg.end .who::after { content: "cerró la conversación"; color: var(--danger); font-weight: 400; margin-left: auto; }
+  .msg.proposal .who::after { content: "propone cerrar"; color: var(--muted); font-weight: 400; margin-left: auto; }
   .banner { align-self: center; color: var(--muted); font-size: 13px; padding: 6px 12px; }
   .empty { margin: auto; color: var(--muted); text-align: center; max-width: 520px; line-height: 1.6; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; background: var(--bg); padding: 1px 5px; border-radius: 4px; }
@@ -141,7 +142,8 @@ function renderHead() {
     chip.style.color = color(p); chip.append(el("span", null, p));
     meta.append(chip);
   });
-  const pill = d.status.closed ? `Cerrada · ${d.status.closed}` : `Turno ${d.status.turns}/${d.max_turns} · le toca a ${d.status.next}`;
+  const proposed = (d.status.end_proposed_by || []).length ? ` · ${d.status.end_proposed_by.join(" y ")} propone cerrar` : "";
+  const pill = d.status.closed ? `Cerrada · ${d.status.closed}` : `Turno ${d.status.turns}/${d.max_turns} · le toca a ${d.status.next}${proposed}`;
   meta.append(el("span", "pill", pill));
   h.append(meta);
   if (d.brief) { const det = el("details"); det.append(el("summary", null, "Brief"), el("pre", null, d.brief)); h.append(det); }
@@ -157,7 +159,7 @@ function appendMessages(msgs) {
   const nearBottom = s.scrollHeight - s.scrollTop - s.clientHeight < 120;
   if ($("empty")) $("empty").remove();
   for (const m of msgs) {
-    const box = el("article", "msg" + (m.from === "human" ? " human" : "") + (m.end ? " end" : ""));
+    const box = el("article", "msg" + (m.from === "human" ? " human" : "") + (m.end ? " end" : "") + (m.end_proposal ? " proposal" : ""));
     box.style.setProperty("--c", color(m.from));
     const who = el("div", "who", m.from); who.append(el("span", null, `#${m.seq} · ${fmtTime(m.ts)}`));
     box.append(who, el("div", "body", m.body));

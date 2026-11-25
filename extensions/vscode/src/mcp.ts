@@ -26,7 +26,7 @@ export function registerNativeMcp(context: vscode.ExtensionContext, state: Achat
       onDidChangeMcpServerDefinitions: changed.event,
       provideMcpServerDefinitions: () => {
         const cli = state.cli;
-        return cli ? [new Definition("achat", cli.config.python, cli.mcpArgs(), {}, "0.2.0")] : [];
+        return cli ? [new Definition("achat", cli.config.python, cli.mcpArgs(), {}, state.version ?? "0")] : [];
       },
       resolveMcpServerDefinition: (def: unknown) => def,
     }),

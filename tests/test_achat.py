@@ -127,8 +127,8 @@ class TestRoomRules(RoomTestCase):
         self.assertEqual(ctx.exception.code, achat.EXIT_CLOSED)
 
         other = self.make_room("o")
-        other.publish("alice", "bye", end=True)
-        self.assertIn("ended by alice", other.status().closed)
+        other.publish(achat.HUMAN, "that's enough", end=True)
+        self.assertIn("ended by human", other.status().closed)  # the human closes at once
 
     def test_message_limits(self):
         room = self.make_room(max_chars=10)
@@ -151,6 +151,70 @@ class TestRoomRules(RoomTestCase):
         text = (room.msgs_dir / files[0]).read_text(encoding="utf-8")
         self.assertTrue(text.startswith("---\nseq: 1\nfrom: alice\nts: "))
         self.assertTrue(text.endswith("---\nhola\n"))
+
+
+class TestEndProposals(RoomTestCase):
+    """An agent can't close a conversation alone: ending needs every agent's agreement."""
+
+    def say(self, room, who, text, end=False):
+        room.set_cursor(who, room.status().last_seq)
+        return room.publish(who, text, end=end)
+
+    def test_proposal_then_agreement_closes(self):
+        room = self.make_room()
+        self.say(room, "alice", "shall we stop?", end=True)
+        st = room.status()
+        self.assertIsNone(st.closed)
+        self.assertEqual(st.end_proposed_by, ("alice",))
+        self.say(room, "bob", "yes, bye", end=True)
+        self.assertEqual(room.status().closed, "all participants agreed to end at #2")
+
+    def test_a_normal_reply_withdraws_the_proposal(self):
+        room = self.make_room()
+        self.say(room, "alice", "shall we stop?", end=True)
+        self.say(room, "bob", "one more point first")
+        st = room.status()
+        self.assertIsNone(st.closed)
+        self.assertEqual(st.end_proposed_by, ())
+
+    def test_three_agents_need_everyone(self):
+        room = self.make_room(participants=("a", "b", "c"))
+        self.say(room, "a", "end?", end=True)
+        self.say(room, "b", "agreed", end=True)
+        self.assertEqual(room.status().end_proposed_by, ("a", "b"))
+        self.say(room, "c", "agreed", end=True)
+        self.assertIn("all participants agreed", room.status().closed)
+
+    def test_human_messages_neither_agree_nor_withdraw(self):
+        room = self.make_room()
+        self.say(room, "alice", "end?", end=True)
+        room.publish(achat.HUMAN, "fine by me")
+        self.assertEqual(room.status().end_proposed_by, ("alice",))
+        self.say(room, "bob", "ok", end=True)
+        self.assertIn("all participants agreed", room.status().closed)
+
+    def test_legacy_end_true_from_an_agent_still_closes(self):
+        room = self.make_room()
+        (room.msgs_dir / "000001-alice.md").write_text("---\nseq: 1\nfrom: alice\nts: x\nend: true\n---\nbye\n", encoding="utf-8")
+        self.assertEqual(achat.Room(self.root, "r").status().closed, "ended by alice at #1")
+
+    def test_on_disk_and_json(self):
+        room = self.make_room()
+        self.say(room, "alice", "end?", end=True)
+        text = (room.msgs_dir / "000001-alice.md").read_text(encoding="utf-8")
+        self.assertIn("\nend: propose\n", text)
+        m = achat.Room(self.root, "r").messages()[0].to_json()
+        self.assertEqual((m["end"], m["end_proposal"]), (False, True))
+
+    def test_the_next_speaker_is_told_how_to_agree(self):
+        self.make_room()
+        self.assertEqual(self.run_cli("send", "--room", "r", "--as", "alice", "--end", "I think we're done")[0], 0)
+        code, out, _ = self.run_cli("wait", "--room", "r", "--as", "bob", "--timeout", "0")
+        self.assertEqual(code, achat.EXIT_OK)
+        self.assertIn("alice proposed to end the conversation", out)
+        self.assertIn("--end", out)
+        code, out, _ = self.run_cli("send", "--room", "r", "--as", "bob", "--end", "agreed, bye")
+        self.assertIn("STATUS: CLOSED — all participants agreed", out)
 
 
 class TestConcurrency(RoomTestCase):
@@ -284,7 +348,7 @@ class TestJsonContract(RoomTestCase):
         self.assertEqual(listing["rooms_dir"], str(self.root))
         self.assertEqual([r["name"] for r in listing["rooms"]], ["r"])
         self.assertNotIn("messages", listing["rooms"][0])
-        self.assertEqual(listing["rooms"][0]["status"], {"turns": 0, "next": "alice", "closed": None, "last_seq": 0})
+        self.assertEqual(listing["rooms"][0]["status"], {"turns": 0, "next": "alice", "closed": None, "last_seq": 0, "end_proposed_by": []})
 
         room = achat.Room(self.root, "r")
         room.publish("alice", "one")
@@ -346,10 +410,10 @@ class TestBridge(RoomTestCase):
     def test_build_chat_alternates_roles(self):
         cfg = achat.Config("t", ("alice", "bot"), 10, 100, "", "")
         msgs = [
-            achat.Message(1, "alice", "", False, "hi"),
-            achat.Message(2, "human", "", False, "be nice"),
-            achat.Message(3, "bot", "", False, "hello"),
-            achat.Message(4, "alice", "", False, "how are you"),
+            achat.Message(1, "alice", "", "", "hi"),
+            achat.Message(2, "human", "", "", "be nice"),
+            achat.Message(3, "bot", "", "", "hello"),
+            achat.Message(4, "alice", "", "", "how are you"),
         ]
         chat = achat.build_chat(cfg, msgs, "bot")
         self.assertEqual([m["role"] for m in chat], ["system", "user", "assistant", "user"])

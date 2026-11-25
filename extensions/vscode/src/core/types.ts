@@ -6,6 +6,8 @@ export interface RoomStatus {
   next: string;
   closed: string | null;
   last_seq: number;
+  /** Agents currently proposing to end (achat ≥ 0.3). */
+  end_proposed_by: string[];
 }
 
 export interface ChatMessage {
@@ -13,6 +15,8 @@ export interface ChatMessage {
   from: string;
   ts: string;
   end: boolean;
+  /** An agent proposed ending with this message (achat ≥ 0.3). */
+  end_proposal: boolean;
   body: string;
 }
 
@@ -65,6 +69,7 @@ function parseStatus(v: unknown): RoomStatus {
     next: need(typeof s.next === "string", "status.next", s.next as string),
     closed: need(s.closed === null || typeof s.closed === "string", "status.closed", s.closed as string | null),
     last_seq: need(typeof s.last_seq === "number", "status.last_seq", s.last_seq as number),
+    end_proposed_by: Array.isArray(s.end_proposed_by) ? s.end_proposed_by.filter((x): x is string => typeof x === "string") : [],
   };
 }
 
@@ -96,6 +101,7 @@ function parseMessage(v: unknown): ChatMessage {
     from: need(typeof m.from === "string", "message.from", m.from as string),
     ts: typeof m.ts === "string" ? m.ts : "",
     end: m.end === true,
+    end_proposal: m.end_proposal === true,
     body: need(typeof m.body === "string", "message.body", m.body as string),
   };
 }

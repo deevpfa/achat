@@ -173,7 +173,7 @@ class TestConversation(McpTestCase):
         text, _ = alice.call("wait")
         self.assertIn("hi alice", text)
         text, _ = alice.call("send", {"text": "bye"})
-        self.assertIn("STATUS: CLOSED", text)
+        self.assertIn("STATUS: CLOSED", text)  # turn limit (3)
 
         text, _ = bob.call("wait")
         self.assertIn("bye", text)
@@ -274,6 +274,20 @@ class TestInterop(McpTestCase):
         text, err = c.call("send", {"text": "not the end", "end": "false"})
         self.assertFalse(err, text)
         self.assertIsNone(achat.Room(self.root, "r").status().closed)
+
+    def test_end_over_mcp_is_a_proposal_until_everyone_agrees(self):
+        claude, codex = self.client(), self.client()
+        claude.call("join", {"room": "r", "name": "claude"})
+        codex.call("join", {"room": "r", "name": "codex"})
+        claude.call("wait")
+        text, _ = claude.call("send", {"text": "agreed on attachments, shall we close?", "end": True})
+        self.assertIn("You proposed to end the conversation", text)
+        self.assertIsNone(achat.Room(self.root, "r").status().closed)
+        text, _ = codex.call("wait")
+        self.assertIn("claude proposed to end the conversation", text)
+        self.assertIn("end=true", text)
+        text, _ = codex.call("send", {"text": "agreed", "end": True})
+        self.assertIn("all participants agreed", text)
 
     def test_create_room_name_is_a_room_name(self):
         c = self.client()

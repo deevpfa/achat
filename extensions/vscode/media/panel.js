@@ -28,7 +28,8 @@
     const closed = !!room.status.closed;
     const title = el("div", "title");
     title.append(el("h1", null, room.name), el("span", "pill" + (closed ? " closed" : ""),
-      closed ? `closed · ${room.status.closed}` : `turn ${room.status.turns}/${room.max_turns} · ${room.status.next}'s turn`));
+      closed ? `closed · ${room.status.closed}` : `turn ${room.status.turns}/${room.max_turns} · ${room.status.next}'s turn` +
+        ((room.status.end_proposed_by || []).length ? ` · ${room.status.end_proposed_by.join(" and ")} proposed to end` : "")));
     h.replaceChildren(title, el("p", "topic", room.topic || "(no topic)"));
 
     const people = el("div", "people");
@@ -75,6 +76,7 @@
       const who = el("div", "who");
       who.append(el("span", "from", m.from), el("span", "meta", `#${m.seq} · ${fmtTime(m.ts)}`));
       if (m.end) who.append(el("span", "ended", "closed the conversation"));
+      else if (m.end_proposal) who.append(el("span", "proposal", "proposes to end"));
       box.append(who, el("div", "body", m.body));
       s.append(box);
     }

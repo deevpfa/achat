@@ -34,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 FORMAT_VERSION = "1"
 HUMAN = "human"
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
@@ -215,16 +215,27 @@ class Config:
     brief: str
 
 
+END_NOW = "true"  # closes the room at once: the human's close (and agents of older clients)
+END_PROPOSE = "propose"  # an agent proposes ending; the room closes once every agent has agreed
+
+
 @dataclass(frozen=True)
 class Message:
     seq: int
     sender: str
     ts: str
-    end: bool
+    end: str  # "", END_PROPOSE or END_NOW
     body: str
 
     def to_json(self) -> Dict[str, object]:
-        return {"seq": self.seq, "from": self.sender, "ts": self.ts, "end": self.end, "body": self.body}
+        return {
+            "seq": self.seq,
+            "from": self.sender,
+            "ts": self.ts,
+            "end": self.end == END_NOW,
+            "end_proposal": self.end == END_PROPOSE,
+            "body": self.body,
+        }
 
 
 @dataclass(frozen=True)
@@ -233,25 +244,47 @@ class Status:
     next_speaker: str
     closed: Optional[str]  # why the room is closed, or None while it is open
     last_seq: int
+    end_proposed_by: Tuple[str, ...] = ()  # agents currently proposing to end, in order
 
 
 def compute_status(cfg: Config, msgs: Sequence[Message]) -> Status:
-    """All room state derives from the message log: nothing else to keep in sync."""
+    """All room state derives from the message log: nothing else to keep in sync.
+
+    Closing: END_NOW closes at once. END_PROPOSE closes only when every agent has proposed or
+    accepted (each sends END_PROPOSE in turn); an agent message without it withdraws the
+    proposal. Human messages neither count as agreement nor withdraw one."""
     agents = cfg.participants
     agent_msgs = [m for m in msgs if m.sender in agents]
     turns = len(agent_msgs)
-    ender = next((m for m in msgs if m.end), None)
-    if ender is not None:
-        closed: Optional[str] = f"ended by {ender.sender} at #{ender.seq}"
-    elif turns >= cfg.max_turns:
+    closed: Optional[str] = None
+    proposers: List[str] = []
+    for m in msgs:
+        if m.end == END_NOW:
+            closed = f"ended by {m.sender} at #{m.seq}"
+            break
+        if m.sender not in agents:
+            continue
+        if m.end == END_PROPOSE:
+            if m.sender not in proposers:
+                proposers.append(m.sender)
+            if len(proposers) == len(agents):
+                closed = f"all participants agreed to end at #{m.seq}"
+                break
+        else:
+            proposers = []
+    if closed is None and turns >= cfg.max_turns:
         closed = f"turn limit reached ({turns}/{cfg.max_turns})"
-    else:
-        closed = None
     if agent_msgs:
         nxt = agents[(agents.index(agent_msgs[-1].sender) + 1) % len(agents)]
     else:
         nxt = agents[0]
-    return Status(turns=turns, next_speaker=nxt, closed=closed, last_seq=msgs[-1].seq if msgs else 0)
+    return Status(
+        turns=turns,
+        next_speaker=nxt,
+        closed=closed,
+        last_seq=msgs[-1].seq if msgs else 0,
+        end_proposed_by=() if closed else tuple(proposers),
+    )
 
 
 def normalize_body(text: str) -> str:
@@ -357,7 +390,7 @@ class Room:
             seq=int(match.group(1)),
             sender=match.group(2),
             ts=meta.get("ts", ""),
-            end=meta.get("end", "").lower() == "true",
+            end={"true": END_NOW, "propose": END_PROPOSE}.get(meta.get("end", "").strip().lower(), ""),
             body=body.rstrip("\n"),
         )
 
@@ -418,11 +451,12 @@ class Room:
                     )
             seq = st.last_seq + 1
             meta: Dict[str, object] = {"seq": seq, "from": sender, "ts": now_iso()}
-            if end:
-                meta["end"] = "true"
+            kind = (END_NOW if sender == HUMAN else END_PROPOSE) if end else ""
+            if kind:
+                meta["end"] = kind
             final = self.msgs_dir / f"{seq:06d}-{sender}.md"
             atomic_write(final, dump_doc(meta, body + "\n"))
-            msg = Message(seq=seq, sender=sender, ts=str(meta["ts"]), end=end, body=body)
+            msg = Message(seq=seq, sender=sender, ts=str(meta["ts"]), end=kind, body=body)
             self._cache[final.name] = msg
         if sender != HUMAN:
             self.set_cursor(sender, seq)
@@ -499,6 +533,8 @@ def send_block(root: Path, room: str, who: str) -> str:
 class Hints:
     """How to tell the caller what to do next: shell commands or MCP tool calls."""
 
+    end_flag = "--end"
+
     def wait(self, timeout: Optional[float] = None) -> str:
         raise NotImplementedError
 
@@ -525,6 +561,7 @@ class CliHints(Hints):
 
 
 class McpHints(Hints):
+    end_flag = "end=true"
     def wait(self, timeout: Optional[float] = None) -> str:
         return "Call the `wait` tool."
 
@@ -537,7 +574,7 @@ class McpHints(Hints):
 
 def fmt_message(m: Message) -> str:
     ts = m.ts.replace("T", " ")
-    flag = " · ENDED THE CONVERSATION" if m.end else ""
+    flag = {END_NOW: " · ENDED THE CONVERSATION", END_PROPOSE: " · PROPOSES TO END"}.get(m.end, "")
     return f"──── #{m.seq} · {m.sender} · {ts}{flag} ────\n{m.body}\n"
 
 
@@ -609,8 +646,9 @@ def protocol_text(root: Path, room: Room, me: str) -> str:
         "2) Send your reply as ONE single-quoted argument (it may span several lines):",
         send_block(root, room.name, me),
         *quoting_help(),
-        "   Add --end before the message only when the conversation has clearly run its course; it closes",
-        "   the room for everyone.",
+        "   When the conversation has run its course, add --end before the message to PROPOSE ending it.",
+        "   The room closes once every participant has agreed (each sends --end in their turn); a normal",
+        "   reply means \"let's go on\" and withdraws the proposal.",
         "",
         "3) Go back to step 1.",
     ]
@@ -630,8 +668,9 @@ def protocol_text_mcp(room: Room, me: str, wait_timeout: float) -> str:
         "HOW TO TAKE PART — use these tools, in a loop:",
         "",
         f"1) `wait` blocks until it is your turn (up to {wait_timeout:g} s) and returns the messages you haven't seen.",
-        "2) `send` posts your reply as plain text. Set end=true only when the conversation has clearly run its",
-        "   course; it closes the room for everyone.",
+        "2) `send` posts your reply as plain text. When the conversation has run its course, set end=true to",
+        "   PROPOSE ending it: the room closes once every participant has agreed (each sends end=true in their",
+        "   turn); a normal reply means \"let's go on\" and withdraws the proposal.",
         "3) Go back to step 1.",
     ]
     lines += loop_rules(me, "call `wait` again.", "call `read`")
@@ -682,6 +721,8 @@ def render_delivery(d: Delivery, cfg: Config, hints: Hints, timeout: Optional[fl
             parts.append(f"The room is empty: you open the conversation. Topic: {cfg.topic or '(none)'}")
         elif not d.messages:
             parts.append("(No new messages since you last read.)")
+        if st.end_proposed_by:
+            parts.append(proposal_line(st, hints))
         parts.append(f"STATUS: YOUR_TURN — turn {st.turns + 1} of {cfg.max_turns}. {hints.send()}")
     else:
         parts.append(
@@ -690,17 +731,30 @@ def render_delivery(d: Delivery, cfg: Config, hints: Hints, timeout: Optional[fl
     return "\n".join(parts)
 
 
+def proposal_line(st: Status, hints: Hints) -> str:
+    who = " and ".join(st.end_proposed_by)
+    return (
+        f"⚑ {who} proposed to end the conversation. If you agree, send your closing message with {hints.end_flag}: "
+        "the room closes once every participant has agreed. If you don't, just reply normally and it goes on."
+    )
+
+
 def render_sent(msg: Message, cfg: Config, st: Status, hints: Hints) -> str:
     if st.closed:
         return f"Sent #{msg.seq}. STATUS: CLOSED — {st.closed}. You're done: summarize the conversation for your user."
-    return f"Sent #{msg.seq} (turn {st.turns} of {cfg.max_turns}). Now wait for the reply. {hints.wait()}"
+    note = ""
+    if msg.end == END_PROPOSE:
+        waiting = [p for p in cfg.participants if p not in st.end_proposed_by]
+        note = f" You proposed to end the conversation: it closes once {' and '.join(waiting)} agree(s)."
+    return f"Sent #{msg.seq} (turn {st.turns} of {cfg.max_turns}).{note} Now wait for the reply. {hints.wait()}"
 
 
 def turn_line(cfg: Config, st: Status, me: str, hints: Hints) -> str:
     if st.closed:
         return f"STATUS: CLOSED — {st.closed}."
     if st.next_speaker == me:
-        return f"STATUS: YOUR_TURN — turn {st.turns + 1} of {cfg.max_turns}. {hints.send()}"
+        lead = proposal_line(st, hints) + "\n" if st.end_proposed_by else ""
+        return f"{lead}STATUS: YOUR_TURN — turn {st.turns + 1} of {cfg.max_turns}. {hints.send()}"
     return f"Not your turn ({st.next_speaker} is next). {hints.wait()}"
 
 
@@ -919,7 +973,13 @@ def room_json(room: Room, after: int = 0) -> Dict[str, object]:
         "max_chars": cfg.max_chars,
         "brief": cfg.brief,
         "created": cfg.created,
-        "status": {"turns": st.turns, "next": st.next_speaker, "closed": st.closed, "last_seq": st.last_seq},
+        "status": {
+            "turns": st.turns,
+            "next": st.next_speaker,
+            "closed": st.closed,
+            "last_seq": st.last_seq,
+            "end_proposed_by": list(st.end_proposed_by),
+        },
         "messages": [m.to_json() for m in msgs if m.seq > after],
     }
 
@@ -1281,11 +1341,11 @@ MCP_TOOLS: List[Dict[str, Any]] = [
         "name": "send",
         "title": "Send my reply",
         "description": "Post your message to the room. Only accepted on your turn and once you have seen every "
-        "message. Set end=true only to close the conversation for everyone.",
+        "message. Set end=true to PROPOSE ending: the room closes once every participant has agreed.",
         "inputSchema": _obj(
             {
                 "text": {"type": "string", "description": "your message as plain text, without a name prefix"},
-                "end": {"type": "boolean", "description": "close the room with this message (default false)"},
+                "end": {"type": "boolean", "description": "propose ending the conversation; it closes once every participant has agreed (default false)"},
                 **_WHO,
             },
             ["text"],
@@ -1672,7 +1732,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("send", parents=[in_room], help="post a message (text from argument, --file or stdin)")
     p.add_argument("--as", dest="who", required=True, help=f"your participant name, or '{HUMAN}'")
     p.add_argument("--file", help="read the message from a file")
-    p.add_argument("--end", action="store_true", help="close the conversation with this message")
+    p.add_argument("--end", action="store_true",
+                   help="agents: propose ending (closes once every participant agrees); human: close at once")
     p.add_argument("text", nargs="?", help="message text as one single-quoted argument (or omit it and pipe stdin)")
     p.set_defaults(func=cmd_send)
 

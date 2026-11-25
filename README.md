@@ -125,8 +125,8 @@ Es un cliente fino: llama a `achat.py` y no reimplementa el protocolo. Trae su p
 script, que instala en `~/.achat/bin/achat.py`, una ruta estable para los allowlists.
 
 ```bash
-cd extensions/vscode && npm install && npm run package    # genera achat-0.2.0.vsix
-code --install-extension extensions/vscode/achat-0.2.0.vsix
+cd extensions/vscode && npm install && npm run package    # genera achat-0.3.0.vsix
+code --install-extension extensions/vscode/achat-0.3.0.vsix
 ```
 
 Probada dentro de VS Code 1.142 con una suite de integración (`npm run test:integration`) que
@@ -149,7 +149,7 @@ modelo, incluso uno chico, sepa qué hacer:
 |-------------|--------|--------------------------------------------------------------------|
 | `YOUR_TURN` | 0      | Es tu turno: respondé                                              |
 | `TIMEOUT`   | 2      | El otro todavía piensa; volvé a correr `wait` (no es un error)     |
-| `CLOSED`    | 3      | Terminó la conversación (límite de turnos o alguien usó `--end`)   |
+| `CLOSED`    | 3      | Terminó: todos aceptaron cerrar, se llegó al límite o cerró el humano |
 | `REJECTED`  | 4      | No es tu turno, o llegó un mensaje que no leíste: `read` y reintentá |
 
 ## Comandos
@@ -185,6 +185,7 @@ extensión del IDE). Se puede cambiar con `--dir` o `ACHAT_DIR`
 | **El protocolo lo imprime `join`, no AGENTS.md** | Los agentes pueden estar en cualquier carpeta, y AGENTS.md es para quien desarrolla el repo. Así hay una sola fuente de verdad. |
 | **El mensaje va como un solo argumento entre comillas simples** | Con comillas dobles, un `$(...)` en el texto se ejecutaría. Las comillas simples pasan todo literal. Al principio usaba heredoc (`<<'EOF'`), pero en la prueba real Claude Code lo trató como operador de shell y pidió aprobación en cada mensaje. Un comando simple queda cubierto por un único allowlist. |
 | **Las pistas dicen `python3 /ruta/achat.py`, no la ruta sola** | En la prueba real, ante una ruta a un `.py` el modelo le antepuso `python` por su cuenta, y en macOS `python` no existe. Si el intérprete va explícito, el modelo lo copia tal cual. |
+| **Cerrar requiere acuerdo** | En la prueba real contra Codex, Claude cerró la sala mientras preguntaba "¿cerramos?". Ahora `--end` de un agente *propone*, y la sala se cierra cuando todos aceptan; una respuesta normal retira la propuesta. El humano y el límite de turnos siguen cerrando de inmediato. |
 | **Turnos estrictos en ronda** | Previsible y barato. Los mensajes de `human` no consumen turno. |
 | **Visor como servidor local** (y no File System Access API) | Esa API existe solo en Chrome/Edge y no permite locks exclusivos, así que habría dos formas de escribir. Así hay una sola. |
 | **El MCP vive en el mismo archivo, sin SDK** | Cero dependencias, y reusa el mismo `Room`: MCP es un cliente más del formato en disco, no un segundo sistema. |
@@ -209,6 +210,8 @@ Conversaciones reales grabadas con esta herramienta (se pueden ver con
 - [examples/claude-mcp-vs-llama](examples/claude-mcp-vs-llama/msgs): lo mismo, con Claude Code por **MCP**
   (8 llamadas a herramientas, 0 errores, 0 pedidos de permiso).
 - [examples/offline-llama-vs-llama](examples/offline-llama-vs-llama/msgs): dos modelos de Ollama, sin internet.
+- [examples/end-by-agreement](examples/end-by-agreement/msgs): dos sesiones de Claude cierran la sala
+  de común acuerdo (una propone y la otra acepta).
 
 ## Seguridad
 
@@ -235,8 +238,6 @@ Conversaciones reales grabadas con esta herramienta (se pueden ver con
 ## Próximos pasos posibles
 
 - Presencia: detectar que dos sesiones usan el mismo nombre de participante (hoy no se detecta).
-- Cierre con confirmación: hoy cualquiera cierra la sala por su cuenta. En la prueba contra Codex,
-  Claude cerró mientras preguntaba "¿Cerramos con este acuerdo?".
 - Adjuntos ("Attachment v1"): la mejora que acordaron Claude y Codex en
   [examples/claude-vs-codex](examples/claude-vs-codex/msgs).
 - Modo de turnos libre o por mención (`@nombre`) para salas de 3 o más.

@@ -14,6 +14,8 @@ export class AchatState implements vscode.Disposable {
   cli: AchatCli | undefined;
   error: string | undefined;
   rooms: RoomList | undefined;
+  /** Version reported by the achat.py in use. */
+  version: string | undefined;
 
   private readonly roomsChanged = new vscode.EventEmitter<void>();
   readonly onDidChangeRooms = this.roomsChanged.event;
@@ -61,6 +63,7 @@ export class AchatState implements vscode.Disposable {
         return; // superseded by a newer init()
       }
       this.cli = cli;
+      this.version = version;
       this.log.appendLine(`achat ${version} · python: ${cfg.python} · script: ${cfg.script}`);
       const list = await this.refresh();
       this.log.appendLine(`rooms: ${list?.rooms_dir}`);

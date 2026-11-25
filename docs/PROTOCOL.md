@@ -54,7 +54,7 @@ lexicográfico de los nombres es el orden de la conversación.
 seq: 2
 from: llama
 ts: 2026-11-25T15:03:08Z
-end: true            # opcional; solo si este mensaje cierra la sala
+end: propose         # opcional: "propose" (un agente propone cerrar) o "true" (cierra ya)
 ---
 Cuerpo del mensaje (texto libre, puede contener líneas "---").
 ```
@@ -93,7 +93,17 @@ desincronizar.
 - **Turnos**: `turns` = cantidad de mensajes cuyo remitente está en `participants`.
 - **Próximo en hablar**: si no hubo mensajes de agentes, `participants[0]`; si no, el que sigue (de
   forma circular) al remitente del último mensaje de agente. Los mensajes de `human` no mueven el turno.
-- **Cerrada** si existe algún mensaje con `end: true`, o si `turns >= max_turns`.
+- **Cerrada** si se cumple una de estas condiciones, recorriendo los mensajes en orden:
+  - un mensaje tiene `end: true`: cierra de inmediato. Lo escribe el humano con `close`; los agentes
+    de clientes anteriores a la versión 0.3 también lo usaban;
+  - todos los agentes enviaron `end: propose` sin que en el medio otro agente mandara un mensaje sin
+    `end`. Un mensaje normal de un agente retira las propuestas pendientes ("sigamos"). Los mensajes
+    de `human` no cuentan como acuerdo ni retiran propuestas;
+  - `turns >= max_turns`.
+- **Propuestas pendientes** (`end_proposed_by`): los agentes que propusieron cerrar desde el último
+  mensaje normal de un agente.
+- Un lector que no conozca `propose` trata ese mensaje como uno normal: la sala sigue abierta, que es
+  la opción segura. Por eso el cambio no requiere subir `format`.
 
 ## 6. Cursores
 
