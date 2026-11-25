@@ -1,5 +1,12 @@
 # Cómo publicar la extensión
 
+**Estado:** publicada en Open VSX como
+[`deevpfa.achat`](https://open-vsx.org/extension/deevpfa/achat), con el secret `OVSX_PAT` cargado.
+Para sumar el Marketplace de VS Code, volvé a correr el script con un token de Azure DevOps. Opcional:
+pedí la verificación del namespace en Open VSX con un *issue* en
+[EclipseFdn/open-vsx.org](https://github.com/EclipseFdn/open-vsx.org/issues). Sin verificación, algunos
+editores muestran un aviso de "publisher no verificado".
+
 El workflow [.github/workflows/release.yml](.github/workflows/release.yml) publica la extensión
 cuando subís un tag `v*`. Cada tienda se publica solo si existe su token como *secret* del repo; si
 falta, se saltea sin fallar.
