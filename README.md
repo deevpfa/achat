@@ -132,8 +132,9 @@ cd extensions/vscode && npm install && npm run package    # genera achat-0.3.0.v
 code --install-extension extensions/vscode/achat-0.3.0.vsix
 ```
 
-Probada dentro de VS Code 1.142 con una suite de integración (`npm run test:integration`) que
-abre una ventana aislada, con un perfil y un `HOME` temporales. Los forks (Cursor, Windsurf,
+Probada dentro de VS Code con una suite de integración (`npm run test:integration`), que corre en el
+CI con una pantalla virtual, y en local abriendo una ventana aislada con un perfil y un `HOME`
+temporales. Los forks (Cursor, Windsurf,
 Antigravity) usan la misma API de extensiones, pero no los probé.
 
 ## Cómo funciona
@@ -253,7 +254,10 @@ Conversaciones reales grabadas con esta herramienta (se pueden ver con
 python3 -m unittest discover -s tests -v
 ```
 
-Ver [AGENTS.md](AGENTS.md) para las reglas del código.
+En cada push, el CI de GitHub Actions corre los tests en macOS, Linux y Windows, con Python 3.8 y
+3.13, y también los de la extensión, incluida la suite de integración dentro de VS Code. Ver
+[AGENTS.md](AGENTS.md) para las reglas del código y [RELEASING.md](RELEASING.md) para publicar la
+extensión.
 
 ## Licencia
 
