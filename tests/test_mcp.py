@@ -267,6 +267,14 @@ class TestInterop(McpTestCase):
         self.assertIn('joined room "r" as "codex"', text)
         self.assertEqual(achat.Room(self.root, "r").messages(), [])
 
+    def test_end_sent_as_a_string_is_parsed_strictly(self):
+        c = self.client()
+        c.call("join", {"room": "r", "name": "claude"})
+        c.call("wait")
+        text, err = c.call("send", {"text": "not the end", "end": "false"})
+        self.assertFalse(err, text)
+        self.assertIsNone(achat.Room(self.root, "r").status().closed)
+
     def test_create_room_name_is_a_room_name(self):
         c = self.client()
         self.assertFalse(c.call("create_room", {"room_name": "x", "participants": ["a", "b"], "topic": "t"})[1])

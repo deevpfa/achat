@@ -48,6 +48,7 @@ export class ConversationPanel implements vscode.Disposable {
   private forceReset = false;
   private onboarding: RoomDetail["onboarding"] = {};
   private refreshing: Promise<void> | undefined;
+  private sendChain: Promise<void> = Promise.resolve(); // sends run one at a time, in order
   private dirty = false;
   private readonly disposables: vscode.Disposable[] = [];
 
@@ -159,13 +160,8 @@ export class ConversationPanel implements vscode.Disposable {
     } else if (m.type === "ready") {
       await this.refresh(true);
     } else if (m.type === "send") {
-      try {
-        await this.state.requireCli().sendAsHuman(this.room, m.text, m.end);
-        await this.panel.webview.postMessage({ type: "sent" });
-        await this.refresh();
-      } catch (e) {
-        await this.panel.webview.postMessage({ type: "error", message: e instanceof Error ? e.message : String(e) });
-      }
+      this.sendChain = this.sendChain.then(() => this.send(m.text, m.end));
+      await this.sendChain;
     } else if (m.type === "copy") {
       const how = this.onboarding[m.participant];
       if (how) {
@@ -178,6 +174,27 @@ export class ConversationPanel implements vscode.Disposable {
       }
     } else if (m.type === "bridge") {
       await vscode.commands.executeCommand("achat.startBridge", this.room, m.participant);
+    }
+  }
+
+  private async send(text: string, end: boolean): Promise<void> {
+    try {
+      if (end) {
+        const ok = await vscode.window.showWarningMessage(
+          `Close room "${this.room}" for every participant?`,
+          { modal: true, detail: "Your message is posted as human and the room closes. Rooms can't be reopened." },
+          "Close Room",
+        );
+        if (!ok) {
+          await this.panel.webview.postMessage({ type: "cancelled" });
+          return;
+        }
+      }
+      await this.state.requireCli().sendAsHuman(this.room, text, end);
+      await this.panel.webview.postMessage({ type: "sent" });
+      await this.refresh();
+    } catch (e) {
+      await this.panel.webview.postMessage({ type: "error", message: e instanceof Error ? e.message : String(e) });
     }
   }
 

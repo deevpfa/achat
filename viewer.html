@@ -85,7 +85,7 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
-const state = { room: null, data: null, lastSeq: 0, timer: null };
+const state = { room: null, data: null, lastSeq: 0, polling: false, sending: false };
 
 async function api(path, opts = {}) {
   const res = await fetch(path, { ...opts, headers: { "X-Achat": "1", "Content-Type": "application/json", ...(opts.headers || {}) } });
@@ -167,7 +167,8 @@ function appendMessages(msgs) {
 }
 
 async function poll() {
-  if (!state.room) return;
+  if (!state.room || state.polling) return; // one request at a time: overlapping polls duplicated messages
+  state.polling = true;
   const room = state.room;
   try {
     const d = await api(`/api/rooms/${encodeURIComponent(room)}?after=${state.lastSeq}`);
@@ -175,13 +176,23 @@ async function poll() {
     const changed = !state.data || JSON.stringify(d.status) !== JSON.stringify(state.data.status);
     state.data = d;
     if (changed) renderHead();
-    if (d.messages.length) { appendMessages(d.messages); state.lastSeq = d.messages[d.messages.length - 1].seq; }
+    const fresh = d.messages.filter((m) => m.seq > state.lastSeq);
+    if (fresh.length) { appendMessages(fresh); state.lastSeq = fresh[fresh.length - 1].seq; }
     if (!state.lastSeq && !$("stream").children.length) {
       $("stream").append(el("div", "empty", "Sala vacía. Esperando que " + d.participants[0] + " abra la conversación…"));
       $("stream").lastChild.id = "empty";
     }
+    if ($("err").dataset.kind === "poll") { $("err").textContent = ""; delete $("err").dataset.kind; }
   } catch (e) {
-    showEmpty("No se pudo cargar la sala: " + e.message);
+    if (room !== state.room) return;
+    if (!state.data) {
+      showEmpty("No se pudo cargar la sala: " + e.message); // nothing on screen yet: nothing to lose
+    } else {
+      $("err").textContent = "Sin conexión con achat serve (" + e.message + "). Reintentando…"; // keep the transcript
+      $("err").dataset.kind = "poll";
+    }
+  } finally {
+    state.polling = false;
   }
 }
 
@@ -194,13 +205,20 @@ function openRoom() {
 }
 
 async function post(end) {
+  if (state.sending) return; // a fast double Enter must not post twice
   const text = $("text").value.trim() || (end ? "El supervisor humano cerró la conversación." : "");
   if (!text) return;
+  state.sending = true;
+  $("send").disabled = true;
   $("err").textContent = "";
   try {
     await api(`/api/rooms/${encodeURIComponent(state.room)}/messages`, { method: "POST", body: JSON.stringify({ text, end }) });
     $("text").value = ""; poll(); loadRooms();
   } catch (e) { $("err").textContent = e.message; }
+  finally {
+    state.sending = false;
+    $("send").disabled = !!(state.data && state.data.status.closed);
+  }
 }
 
 $("composer").addEventListener("submit", (e) => { e.preventDefault(); post(false); });

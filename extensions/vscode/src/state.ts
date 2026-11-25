@@ -23,6 +23,7 @@ export class AchatState implements vscode.Disposable {
   private timer: NodeJS.Timeout | undefined;
   private signature = "";
   private polling = false;
+  private generation = 0; // a newer init() wins; older ones stop touching state
   private readonly disposables: vscode.Disposable[] = [];
 
   constructor(
@@ -43,6 +44,7 @@ export class AchatState implements vscode.Disposable {
 
   /** (Re)builds the CLI from settings, checks it works, loads rooms, starts polling. */
   async init(): Promise<void> {
+    const gen = ++this.generation;
     this.stop();
     this.cli = undefined;
     this.error = undefined;
@@ -55,15 +57,25 @@ export class AchatState implements vscode.Disposable {
       if (compareVersions(version, MIN_ACHAT_VERSION) < 0) {
         throw new Error(`${cfg.script} is achat ${version}; this extension needs ${MIN_ACHAT_VERSION} or newer.`);
       }
+      if (gen !== this.generation) {
+        return; // superseded by a newer init()
+      }
       this.cli = cli;
       this.log.appendLine(`achat ${version} · python: ${cfg.python} · script: ${cfg.script}`);
       const list = await this.refresh();
       this.log.appendLine(`rooms: ${list?.rooms_dir}`);
     } catch (e) {
+      if (gen !== this.generation) {
+        return;
+      }
       this.error = e instanceof Error ? e.message : String(e);
       this.log.appendLine(`ERROR: ${this.error}`);
     }
+    if (gen !== this.generation) {
+      return;
+    }
     this.roomsChanged.fire();
+    this.stop(); // never leave two timers running
     this.timer = setInterval(() => void this.poll(), POLL_MS);
   }
 
@@ -82,9 +94,12 @@ export class AchatState implements vscode.Disposable {
     if (!this.cli) {
       return undefined;
     }
+    // Fingerprint BEFORE listing: a message written in between then shows up as a change on the
+    // next poll. Taking it after the list could absorb that message and leave the tree stale.
+    const before = this.rooms ? await roomsSignature(this.rooms.rooms_dir) : "";
     const list = await this.cli.list();
     this.rooms = list;
-    this.signature = await roomsSignature(list.rooms_dir);
+    this.signature = before;
     this.roomsChanged.fire();
     return list;
   }

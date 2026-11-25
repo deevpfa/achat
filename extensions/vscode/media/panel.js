@@ -10,6 +10,7 @@
     return n;
   };
   let room = null;
+  let sending = false; // a fast double Enter must not post twice
 
   function color(name) {
     if (!room || name === "human") return "var(--achat-human)";
@@ -97,16 +98,25 @@
       vscode.postMessage({ type: "rendered", messages: document.querySelectorAll("#stream .msg").length });
     } else if (m.type === "sent") {
       $("text").value = "";
-      $("send").disabled = false;
+      done();
+    } else if (m.type === "cancelled") {
+      done(); // the user declined to close the room: keep the text
     } else if (m.type === "error") {
       $("err").textContent = m.message;
-      $("send").disabled = false;
+      done();
     }
   });
 
+  function done() {
+    sending = false;
+    $("send").disabled = !!(room && room.status.closed);
+  }
+
   function post(end) {
+    if (sending) return;
     const text = $("text").value.trim() || (end ? "The human supervisor closed the conversation." : "");
     if (!text) return;
+    sending = true;
     $("send").disabled = true;
     vscode.postMessage({ type: "send", text, end });
   }

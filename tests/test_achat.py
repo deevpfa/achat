@@ -60,6 +60,22 @@ class TestFormat(unittest.TestCase):
         self.assertEqual(achat.parse_doc("plain"), ({}, "plain"))
 
 
+class TestHelpers(unittest.TestCase):
+    def test_parse_bool_is_strict(self):
+        for v, want in [(None, False), (False, False), (True, True), ("false", False), ("TRUE", True), (0, False), (1, True)]:
+            self.assertIs(achat.parse_bool(v, "end"), want, v)
+        for bad in ("no", "", "yes", 2, 1.0, [], {}):
+            with self.assertRaises(achat.ChatError):
+                achat.parse_bool(bad, "end")
+
+    def test_quoting_per_platform(self):
+        self.assertEqual(achat.quote_arg("/a/b c/achat.py", windows=False), "'/a/b c/achat.py'")
+        self.assertEqual(achat.quote_arg(r"C:\Users\me\achat.py", windows=True), r"C:\Users\me\achat.py")
+        self.assertEqual(achat.quote_arg(r"C:\Program Files\achat.py", windows=True), r'"C:\Program Files\achat.py"')
+        self.assertIn("PowerShell: write ' as ''", "\n".join(achat.quoting_help(windows=True)))
+        self.assertIn("'\\''", "\n".join(achat.quoting_help(windows=False)))
+
+
 class TestRoomRules(RoomTestCase):
     def test_create_validates(self):
         with self.assertRaises(achat.ChatError):
@@ -410,6 +426,23 @@ class TestServer(RoomTestCase):
 
     def test_unknown_room(self):
         self.assertEqual(self.request("/api/rooms/nope")[0], 404)
+
+    def test_end_as_string_false_does_not_close(self):
+        hdrs = {"X-Achat": "1", "Content-Type": "application/json"}
+        self.assertEqual(self.request("/api/rooms/r/messages", json.dumps({"text": "a", "end": "false"}).encode(), hdrs)[0], 200)
+        self.assertIsNone(achat.Room(self.root, "r").status().closed)
+        self.assertEqual(self.request("/api/rooms/r/messages", json.dumps({"text": "b", "end": "maybe"}).encode(), hdrs)[0], 409)
+
+    def test_recreated_room_is_not_served_from_cache(self):
+        achat.Room(self.root, "r").publish("alice", "old message")
+        self.assertEqual(self.request("/api/rooms/r")[1]["messages"][0]["body"], "old message")
+        import shutil
+        shutil.rmtree(self.root / "r")
+        self.assertEqual(self.request("/api/rooms/r")[0], 404)
+        achat.Room.create(self.root, "r", topic="new", participants=["x", "y"])
+        achat.Room(self.root, "r").publish("x", "new message")
+        data = self.request("/api/rooms/r")[1]
+        self.assertEqual((data["participants"], [m["body"] for m in data["messages"]]), (["x", "y"], ["new message"]))
 
 
 if __name__ == "__main__":

@@ -69,6 +69,20 @@ class ChatError(Exception):
 # --------------------------------------------------------------------------
 
 
+def parse_bool(value: Any, what: str) -> bool:
+    """Strict: `bool("false")` is True in Python, and some clients send booleans as strings.
+    Closing a room is irreversible, so anything ambiguous is an error, not a guess."""
+    if value is None or value is False:
+        return False
+    if value is True:
+        return True
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    if type(value) is int and value in (0, 1):
+        return value == 1
+    raise ChatError(f"`{what}` must be true or false (got {value!r})", EXIT_REJECTED)
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -432,17 +446,42 @@ def list_rooms(root: Path) -> List[Room]:
 # --------------------------------------------------------------------------
 
 
+WINDOWS = os.name == "nt"
+
+
+def quote_arg(arg: str, windows: bool = WINDOWS) -> str:
+    """Quote a path for the agent's shell. On Windows the shell may be cmd, PowerShell or Git Bash:
+    double quotes work in all three for paths (which never contain quotes or `$`)."""
+    if not windows:
+        return shlex.quote(arg)
+    return arg if re.fullmatch(r"[\w@%+=:,./\\-]+", arg) else f'"{arg}"'
+
+
 def self_cmd() -> str:
     # Always spell out the interpreter: models copy this verbatim, and agents that see a bare
     # path to a .py file tend to prepend `python` themselves (which may not exist). It also
     # gives users a single prefix to allowlist, e.g. Bash(python3 /path/achat.py:*).
-    return f"{'python' if os.name == 'nt' else 'python3'} {shlex.quote(str(SCRIPT_PATH))}"
+    return f"{'python' if WINDOWS else 'python3'} {quote_arg(str(SCRIPT_PATH))}"
+
+
+def quoting_help(windows: bool = WINDOWS) -> List[str]:
+    if not windows:
+        return [
+            "   Inside the quotes, write every apostrophe ' as '\\'' (close quote, escaped quote, reopen).",
+            "   Never wrap the message in double quotes: the shell would execute any $ or backticks in it.",
+        ]
+    return [
+        "   Inside the quotes, escape apostrophes the way YOUR shell needs:",
+        "     PowerShell: write ' as ''        bash (Git Bash, WSL): write ' as '\\''",
+        "   cmd.exe has no single quotes: if that is your shell, use achat's MCP server instead.",
+        "   Never wrap the message in double quotes: the shell could expand $ or % in it.",
+    ]
 
 
 def cmd_hint(root: Path, sub: str, room: Optional[str] = None, who: Optional[str] = None) -> str:
     parts = [self_cmd(), sub]
     if root != default_root():
-        parts += ["--dir", shlex.quote(str(root))]
+        parts += ["--dir", quote_arg(str(root))]
     if room:
         parts += ["--room", room]
     if who:
@@ -569,8 +608,7 @@ def protocol_text(root: Path, room: Room, me: str) -> str:
         "",
         "2) Send your reply as ONE single-quoted argument (it may span several lines):",
         send_block(root, room.name, me),
-        "   Inside the quotes, write every apostrophe ' as '\\'' (close quote, escaped quote, reopen).",
-        "   Never wrap the message in double quotes: the shell would execute any $ or backticks in it.",
+        *quoting_help(),
         "   Add --end before the message only when the conversation has clearly run its course; it closes",
         "   the room for everyone.",
         "",
@@ -781,7 +819,7 @@ def cmd_send(args: argparse.Namespace) -> int:
     msg = room.publish(who, read_text_arg(args), end=args.end)
     cfg, st = room.config, room.status()
     if who == HUMAN:
-        out(f"Sent #{msg.seq} as {HUMAN}. Room: {summary(cfg, st)}")
+        out(f"Sent #{msg.seq} as {HUMAN}. Room: {summary(cfg, st)}", f"Watch the replies: {cmd_hint(root, 'tail', room.name)}")
     else:
         out(render_sent(msg, cfg, st, CliHints(root, room.name, who)))
     return EXIT_OK
@@ -853,13 +891,14 @@ def cmd_list(args: argparse.Namespace) -> int:
     for room in rooms:
         cfg = room.config
         out(f"{room.name:<24} {summary(cfg, room.status()):<44} {cfg.topic}")
+    out("", f"Next: {cmd_hint(root, 'read')} --room <name>   ·   take part: {cmd_hint(root, 'join')} --room <name> --as <participant>")
     return EXIT_OK
 
 
 def cmd_close(args: argparse.Namespace) -> int:
     _, room = open_room(args)
     msg = room.publish(HUMAN, args.reason or "The human supervisor closed the conversation.", end=True)
-    out(f"Closed room '{room.name}' with message #{msg.seq}.")
+    out(f"Closed room '{room.name}' with message #{msg.seq}.", f"STATUS: CLOSED — ended by {HUMAN} at #{msg.seq}.")
     return EXIT_OK
 
 
@@ -889,15 +928,24 @@ ROOM_PATH_RE = re.compile(r"^/api/rooms/([a-z0-9][a-z0-9_-]{0,31})(/messages)?$"
 
 
 def make_server(root: Path, host: str = "127.0.0.1", port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
-    rooms: Dict[str, Room] = {}  # reuse Room objects so their message cache survives across polls
+    # Reuse Room objects so their message cache survives across polls, but only while room.md
+    # is the same file: a room deleted and re-created under the same name must not show old data.
+    rooms: Dict[str, Tuple[Tuple[int, int], Room]] = {}
 
     def get_room(name: str) -> Room:
-        room = rooms.get(name)
-        if room is None:
-            room = Room(root, name)
-            room.config
-            rooms[name] = room
-        return room
+        fresh = Room(root, name)  # validates the name before any path is built
+        try:
+            st = (fresh.dir / "room.md").stat()
+        except FileNotFoundError:
+            rooms.pop(name, None)
+            raise ChatError(f"room {name!r} not found in {root}") from None
+        key = (st.st_ino, st.st_mtime_ns)
+        hit = rooms.get(name)
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        fresh.config
+        rooms[name] = (key, fresh)
+        return fresh
 
     class Handler(BaseHTTPRequestHandler):
         server_version = f"achat/{VERSION}"
@@ -978,7 +1026,7 @@ def make_server(root: Path, host: str = "127.0.0.1", port: int = DEFAULT_PORT) -
                     return self._json(413, {"error": "too large"})
                 data = json.loads(self.rfile.read(length) or b"{}")
                 room = get_room(match.group(1))
-                msg = room.publish(HUMAN, str(data.get("text", "")), end=bool(data.get("end")))
+                msg = room.publish(HUMAN, str(data.get("text", "")), end=parse_bool(data.get("end"), "end"))
                 return self._json(200, {"seq": msg.seq})
             except ChatError as e:
                 return self._json(409 if e.code in (EXIT_REJECTED, EXIT_CLOSED) else 404, {"error": str(e)})
@@ -1551,8 +1599,7 @@ class McpServer:
         text = _arg(args, "text")
         if not isinstance(text, str):
             raise ChatError("`text` must be a string with your message", EXIT_REJECTED)
-        end = args.get("end", False)
-        msg = room.publish(me, text, end=bool(end), hints=self.hints)
+        msg = room.publish(me, text, end=parse_bool(args.get("end"), "end"), hints=self.hints)
         return render_sent(msg, room.config, room.status(), self.hints), None
 
     def _tool_read(self, args: Dict[str, Any], **_: Any) -> Reply:
@@ -1560,7 +1607,7 @@ class McpServer:
         cfg = room.config
         msgs = room.messages()
         st = room.status(msgs)
-        if _arg(args, "all"):
+        if parse_bool(_arg(args, "all"), "all"):
             text = "\n".join([transcript_header(room), *[fmt_message(m) for m in msgs], turn_line(cfg, st, me, self.hints)])
         else:
             seen = room.cursor(me)
