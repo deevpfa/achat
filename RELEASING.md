@@ -11,7 +11,26 @@ Hay dos tiendas, y conviene publicar en las dos:
 | VS Code Marketplace | VS Code | `VSCE_PAT` |
 | Open VSX | Cursor, Windsurf, Antigravity, VSCodium | `OVSX_PAT` |
 
-## Una sola vez: crear las cuentas (requiere tu login)
+## Una sola vez
+
+Lo único que requiere tu login es crear las cuentas y los tokens (pasos 1 y 2 de la sección
+siguiente, en el navegador). Todo lo demás lo hace un solo comando:
+
+```bash
+scripts/setup-store-publishing.sh            # pide el publisher ID y los dos tokens (sin mostrarlos)
+scripts/setup-store-publishing.sh --dry-run  # muestra qué haría, sin cambiar nada
+```
+
+El script:
+- verifica el token del Marketplace;
+- crea el namespace en Open VSX;
+- guarda `VSCE_PAT` y `OVSX_PAT` como secrets del repo (por stdin, nunca como argumentos);
+- pone tu publisher y una versión nueva en `package.json`;
+- commitea, taguea y hace push.
+
+El workflow de release publica en las dos tiendas.
+
+## Detalle: crear las cuentas (requiere tu login)
 
 1. **VS Code Marketplace.**
    1. Entrá a <https://marketplace.visualstudio.com/manage> y creá un *publisher*. El ID es único y
