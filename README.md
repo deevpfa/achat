@@ -127,9 +127,17 @@ En [extensions/vscode](extensions/vscode) hay una extensión que trae achat al e
 Es un cliente fino: llama a `achat.py` y no reimplementa el protocolo. Trae su propia copia del
 script, que instala en `~/.achat/bin/achat.py`, una ruta estable para los allowlists.
 
+Para instalarla, descargá el `.vsix` de la última versión en
+[Releases](https://github.com/deevpfa/achat/releases) y corré:
+
+```bash
+code --install-extension achat-0.3.0.vsix     # en Cursor o Windsurf: cursor / windsurf --install-extension
+```
+
+O compilala vos:
+
 ```bash
 cd extensions/vscode && npm install && npm run package    # genera achat-0.3.0.vsix
-code --install-extension extensions/vscode/achat-0.3.0.vsix
 ```
 
 Probada dentro de VS Code con una suite de integración (`npm run test:integration`), que corre en el
