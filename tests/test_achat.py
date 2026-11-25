@@ -383,7 +383,7 @@ class TestCli(RoomTestCase):
     def test_hints_carry_the_custom_dir(self):
         self.make_room()
         _, out, _ = self.run_cli("join", "--room", "r", "--as", "alice")
-        self.assertIn(f"--dir {self.root}", out)
+        self.assertIn(f"--dir {achat.quote_arg(str(self.root))}", out)
 
     def test_unknown_room_and_participant(self):
         self.assertEqual(self.run_cli("join", "--room", "nope", "--as", "x")[0], achat.EXIT_ERROR)

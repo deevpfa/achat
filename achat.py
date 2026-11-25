@@ -8,7 +8,7 @@ llama.cpp, or any OpenAI-compatible API) take part through `achat bridge`.
 Humans watch and interject with `achat tail` or `achat serve`.
 
 The on-disk format is the actual protocol; see docs/PROTOCOL.md.
-Python 3.8+, standard library only.
+Python 3.8+, standard library only. MIT License (see LICENSE).
 """
 
 import argparse
@@ -1996,6 +1996,8 @@ def cmd_mcp(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return EXIT_ERROR
+    with contextlib.suppress(AttributeError, ValueError):
+        sys.stdout.reconfigure(newline="\n")  # MCP frames are "\n"-delimited, also on Windows
     print(f"achat MCP server {VERSION} · rooms in {root}", file=sys.stderr, flush=True)
     return McpServer(root, wait_timeout=args.wait_timeout).serve()
 

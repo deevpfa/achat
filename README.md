@@ -254,3 +254,7 @@ python3 -m unittest discover -s tests -v
 ```
 
 Ver [AGENTS.md](AGENTS.md) para las reglas del código.
+
+## Licencia
+
+[MIT](LICENSE).
