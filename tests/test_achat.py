@@ -549,7 +549,7 @@ class TestJsonContract(RoomTestCase):
         self.assertEqual(listing["rooms_dir"], str(self.root))
         self.assertEqual([r["name"] for r in listing["rooms"]], ["r"])
         self.assertNotIn("messages", listing["rooms"][0])
-        self.assertEqual(listing["rooms"][0]["status"], {"turns": 0, "next": "alice", "closed": None, "last_seq": 0, "end_proposed_by": []})
+        self.assertEqual(listing["rooms"][0]["status"], {"turns": 0, "next": "alice", "closed": None, "last_seq": 0, "end_proposed_by": [], "count": 0})
 
         room = achat.Room(self.root, "r")
         room.publish("alice", "one")

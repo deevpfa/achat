@@ -46,6 +46,11 @@ npm run package                            # genera el .vsix
   agente. Los adjuntos por MCP van inline; `send --attach` sí lee rutas, porque corre en la shell del agente.
 - **El contenido de un adjunto nunca se sirve como HTML**: `serve` lo entrega como descarga, con `text/plain` o
   `application/octet-stream` y CSP `sandbox`.
+- **Remoto: el servidor nunca confía en el cliente.** Sala y participante salen del token (`find_invite`),
+  y el visor y la API del humano solo atienden loopback (`is_loopback`). Los tokens se guardan hasheados
+  y en archivos con permisos 600 (`write_private`).
+- **`RemoteRoom` imita a `Room`.** Si agregás un método de `Room` que usan las herramientas MCP,
+  implementalo también en `RemoteRoom` (por HTTP) o el modo remoto se rompe.
 - **Esquemas de herramientas MCP mínimos** (`type`, `properties`, `required`, `description`, `items`):
   validá en el servidor.
 
@@ -60,5 +65,6 @@ npm run package                            # genera el .vsix
 - `extensions/vscode/`: extensión para VS Code y forks. `src/core/` es puro (sin `vscode`, testeable
   con node); `src/*.ts` es la parte que depende del editor; `media/panel.js` es la webview. Copia
   `achat.py` en `cli/` al compilar; nunca la edites ahí, la fuente es la de la raíz.
+- `tests/test_remote.py`: invitaciones, alcance del token, ETag y una conversación MCP remota completa.
 - `tests/test_mcp.py`: el servidor MCP por stdio real: handshake, dos agentes MCP conversando, ping y
   cancelación durante `wait`, progreso, EOF y errores.

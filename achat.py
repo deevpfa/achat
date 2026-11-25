@@ -15,6 +15,9 @@ import argparse
 import base64
 import contextlib
 import hashlib
+import hmac
+import ipaddress
+import subprocess
 import json
 import mimetypes
 import os
@@ -1314,6 +1317,11 @@ def make_server(root: Path, host: str = "127.0.0.1", port: int = DEFAULT_PORT) -
             p = self._port()
             return self.headers.get("Host", "") in {f"127.0.0.1:{p}", f"localhost:{p}"}
 
+        def _local(self) -> bool:
+            # The viewer and its human API are for the person at this machine only, even when the
+            # server listens on a network address for remote participants.
+            return is_loopback(self.client_address[0])
+
         def _send(self, code: int, body: bytes, ctype: str, extra: Optional[Dict[str, str]] = None) -> None:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
@@ -1337,9 +1345,11 @@ def make_server(root: Path, host: str = "127.0.0.1", port: int = DEFAULT_PORT) -
             self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
 
         def do_GET(self) -> None:  # noqa: N802 - stdlib naming
-            if not self._host_ok():
-                return self._json(403, {"error": "forbidden host"})
             url = urllib.parse.urlsplit(self.path)
+            if url.path.startswith("/api/p/"):
+                return participant_api(self, root, get_room, "GET", url)
+            if not self._local() or not self._host_ok():
+                return self._json(403, {"error": "forbidden host"})
             try:
                 if url.path == "/":
                     viewer = SCRIPT_DIR / "viewer.html"
@@ -1377,6 +1387,10 @@ def make_server(root: Path, host: str = "127.0.0.1", port: int = DEFAULT_PORT) -
                 return self._json(400, {"error": "bad request"})
 
         def do_POST(self) -> None:  # noqa: N802 - stdlib naming
+            if urllib.parse.urlsplit(self.path).path.startswith("/api/p/"):
+                return participant_api(self, root, get_room, "POST", urllib.parse.urlsplit(self.path))
+            if not self._local():
+                return self._json(403, {"error": "forbidden"})
             p = self._port()
             origin = self.headers.get("Origin")
             # A custom header forces a CORS preflight, which we never approve, so other
@@ -1406,9 +1420,23 @@ def make_server(root: Path, host: str = "127.0.0.1", port: int = DEFAULT_PORT) -
 
 def cmd_serve(args: argparse.Namespace) -> int:
     root = resolve_root(args.dir)
-    server = make_server(root, port=args.port)
-    url = f"http://127.0.0.1:{server.server_address[1]}/"
-    out(f"achat viewer: {url}   (rooms in {root}; only reachable from this machine)  Ctrl+C to stop")
+    host = tailscale_ip() if args.host == "tailscale" else args.host
+    if not host:
+        raise ChatError("couldn't get this machine's Tailscale address (`tailscale ip -4`). Is Tailscale running?")
+    server = make_server(root, host=host, port=args.port)
+    port = server.server_address[1]
+    url = f"http://127.0.0.1:{port}/"
+    lines = [f"achat viewer: {url}   (rooms in {root}; the viewer is only reachable from this machine)  Ctrl+C to stop"]
+    if not is_loopback(host):
+        if host in ("0.0.0.0", "::"):
+            shown = tailscale_ip() or "THIS-MACHINE'S-ADDRESS"
+            lines.append(f"Remote participants: http://{shown}:{port}  (only with an invite: achat invite --room R --as NAME)")
+            lines.append("WARNING: listening on every network interface. Prefer --host tailscale: only your Tailscale network can connect.")
+        else:
+            lines.append(f"Remote participants: http://{host}:{port}  (only with an invite: achat invite --room R --as NAME)")
+            if not is_private_net(host):
+                lines.append("WARNING: plain HTTP on a non-private address. Invites travel unencrypted: use Tailscale or a VPN.")
+    out(*lines)
     if args.open:
         webbrowser.open(url)
     try:
@@ -1417,6 +1445,426 @@ def cmd_serve(args: argparse.Namespace) -> int:
         pass
     finally:
         server.server_close()
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------
+# Remote participants: an agent on another machine joins a room hosted here
+# --------------------------------------------------------------------------
+# The host runs `achat serve --host tailscale` and gives each remote participant an invite.
+# An invite is a secret token bound to ONE room and ONE participant: it can't read other rooms,
+# speak as anyone else, or reach the human's viewer. Only its SHA-256 is stored on the host.
+# The guest stores it (mode 600) with `achat remote add` and runs `achat mcp --remote NAME`:
+# the same MCP tools, backed by RemoteRoom (HTTP) instead of Room (files). Turns, "read before
+# you reply" and every other rule are still decided by the host's Room.
+
+INVITE_PREFIX = "achat1:"
+MAX_API_BODY = 32 * 1024 * 1024
+
+
+def is_loopback(addr: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr.split("%")[0])
+        return ip.is_loopback or (ip.version == 6 and ip.ipv4_mapped is not None and ip.ipv4_mapped.is_loopback)
+    except ValueError:
+        return addr == "localhost"
+
+
+def is_private_net(addr: str) -> bool:
+    """Tailscale (100.64.0.0/10, fd7a:115c:a1e0::/48), loopback or RFC 1918: no plain-HTTP warning."""
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    if ip.version == 4 and ip in ipaddress.ip_network("100.64.0.0/10"):
+        return True
+    if ip.version == 6 and ip in ipaddress.ip_network("fd7a:115c:a1e0::/48"):
+        return True
+    return ip.is_loopback or ip.is_private
+
+
+def tailscale_ip() -> Optional[str]:
+    try:
+        out_ = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=10).stdout.split()
+        return out_[0] if out_ else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def config_home() -> Path:
+    return Path(os.environ.get("ACHAT_HOME") or Path.home() / ".achat").expanduser()
+
+
+def write_private(path: Path, text: str) -> None:
+    """Atomic write readable only by this user (tokens)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".tmp-{uuid.uuid4().hex}"
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def invites_path(room: Room) -> Path:
+    return room.state_dir / "invites.json"
+
+
+def load_invites(room: Room) -> Dict[str, Dict[str, str]]:
+    try:
+        data = json.loads(invites_path(room).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def create_invite(room: Room, who: str) -> str:
+    """A fresh token for `who` (replacing any previous one, which stops working)."""
+    room.require_participant(who)
+    token = secrets.token_urlsafe(32)
+    data = load_invites(room)
+    data[who] = {"sha256": _token_hash(token), "created": now_iso()}
+    write_private(invites_path(room), json.dumps(data, indent=1) + "\n")
+    return token
+
+
+def revoke_invite(room: Room, who: str) -> bool:
+    data = load_invites(room)
+    if who not in data:
+        return False
+    del data[who]
+    write_private(invites_path(room), json.dumps(data, indent=1) + "\n")
+    return True
+
+
+def find_invite(root: Path, token: str, get_room: Callable[[str], Room]) -> Optional[Tuple[Room, str]]:
+    if not token:
+        return None
+    digest = _token_hash(token)
+    for r in list_rooms(root):
+        for who, inv in load_invites(r).items():
+            if isinstance(inv, dict) and hmac.compare_digest(str(inv.get("sha256", "")), digest):
+                return get_room(r.name), who
+    return None
+
+
+def encode_invite(url: str, room: str, who: str, token: str) -> str:
+    raw = json.dumps({"v": 1, "url": url.rstrip("/"), "room": room, "as": who, "token": token}, separators=(",", ":"))
+    return INVITE_PREFIX + base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def decode_invite(code: str) -> Dict[str, str]:
+    code = code.strip()
+    if not code.startswith(INVITE_PREFIX):
+        raise ChatError(f"that is not an achat invite (it should start with {INVITE_PREFIX})")
+    body = code[len(INVITE_PREFIX):]
+    try:
+        inv = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode("utf-8"))
+    except ValueError:
+        raise ChatError("the invite is damaged: copy it again, complete") from None
+    if not all(isinstance(inv.get(k), str) and inv[k] for k in ("url", "room", "as", "token")):
+        raise ChatError("the invite is incomplete")
+    validate_name(inv["room"], "room name"); validate_name(inv["as"], "participant name")
+    if not re.match(r"^https?://", inv["url"]):
+        raise ChatError("the invite has an invalid address")
+    return inv
+
+
+def _wire_message(m: Message) -> Dict[str, object]:
+    j = m.to_json()
+    j["end_kind"] = m.end
+    return j
+
+
+def participant_api(h: BaseHTTPRequestHandler, root: Path, get_room: Callable[[str], Room], method: str, url: Any) -> None:
+    """The host side of a remote participant: every call acts as the invite's participant, in its room."""
+    send = h._json  # type: ignore[attr-defined]
+    auth = h.headers.get("Authorization", "")
+    found = find_invite(root, auth[7:].strip() if auth.startswith("Bearer ") else "", get_room)
+    if found is None:
+        return send(401, {"error": "invalid or revoked invite"})
+    room, who = found
+    path = url.path[len("/api/p/"):]
+    try:
+        if method == "GET" and path == "room":
+            cfg = room.config
+            return send(200, {"achat_version": VERSION, "name": room.name, "me": who, "topic": cfg.topic,
+                              "participants": list(cfg.participants), "max_turns": cfg.max_turns, "max_chars": cfg.max_chars,
+                              "max_attachment_bytes": cfg.max_attachment_bytes, "brief": cfg.brief, "created": cfg.created,
+                              "format": cfg.format})
+        if method == "GET" and path == "messages":
+            msgs = room.messages()
+            etag = '"%d-%s"' % (len(msgs), msgs[-1].id if msgs else "")
+            if h.headers.get("If-None-Match") == etag:
+                h.send_response(304); h.send_header("ETag", etag); h.end_headers(); return None
+            body = json.dumps({"messages": [_wire_message(m) for m in msgs]}, ensure_ascii=False).encode("utf-8")
+            return h._send(200, body, "application/json; charset=utf-8", extra={"ETag": etag})  # type: ignore[attr-defined]
+        if method == "GET" and path == "seen":
+            msgs = room.messages()
+            unseen = {m.id for m in room.unseen(who, msgs)}
+            return send(200, {"seen": [m.id for m in msgs if m.id not in unseen]})
+        if method == "GET" and path.startswith("attachments/"):
+            a = room.find_attachment(path.split("/", 1)[1])
+            return h._send(200, room.attachment_bytes(a.sha256), "application/octet-stream")  # type: ignore[attr-defined]
+        if method == "POST":
+            length = int(h.headers.get("Content-Length") or 0)
+            if length > MAX_API_BODY:
+                return send(413, {"error": "too large"})
+            data = json.loads(h.rfile.read(length) or b"{}")
+            if not isinstance(data, dict):
+                return send(400, {"error": "bad request"})
+            if path == "seen":
+                ids = set(x for x in data.get("ids", []) if isinstance(x, str))
+                room.mark_seen(who, [m for m in room.messages() if m.id in ids])
+                return send(200, {"ok": True})
+            if path == "send":
+                files = []
+                for it in data.get("attachments") or []:
+                    if not isinstance(it, dict) or not isinstance(it.get("name"), str) or not isinstance(it.get("content_base64"), str):
+                        return send(400, {"error": "each attachment needs name and content_base64"})
+                    files.append((it["name"], base64.b64decode(it["content_base64"], validate=True)))
+                msg = room.publish(who, str(data.get("text", "")), end=parse_bool(data.get("end"), "end"),
+                                   hints=McpHints(), attachments=files)
+                return send(200, {"message": _wire_message(msg)})
+        return send(404, {"error": "not found"})
+    except ChatError as e:
+        return send(409 if e.code in (EXIT_REJECTED, EXIT_CLOSED) else 400, {"error": str(e), "code": e.code})
+    except (ValueError, KeyError):
+        return send(400, {"error": "bad request"})
+
+
+class RemoteRoom(Room):
+    """A room hosted on another machine, reached through its participant API. Same interface as
+    Room for everything the MCP tools use; the host's Room still enforces every rule."""
+
+    def __init__(self, invite: Dict[str, str]):
+        super().__init__(Path("/achat-remote"), invite["room"])
+        self.url, self.token, self.me = invite["url"].rstrip("/"), invite["token"], invite["as"]
+        self._etag: Optional[str] = None
+        self._msgs: List[Message] = []
+        self._blobs: Dict[str, bytes] = {}
+
+    def _call(self, method: str, path: str, body: Optional[dict] = None, raw: bool = False, etag: Optional[str] = None) -> Any:
+        headers = {"Authorization": f"Bearer {self.token}"}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8"); headers["Content-Type"] = "application/json"
+        if etag:
+            headers["If-None-Match"] = etag
+        req = urllib.request.Request(f"{self.url}/api/p/{path}", data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                payload = resp.read()
+                return (payload, resp.headers.get("ETag")) if raw else (json.loads(payload or b"{}"), resp.headers.get("ETag"))
+        except urllib.error.HTTPError as e:
+            with e:
+                if e.code == 304:
+                    return None, etag
+                try:
+                    err = json.loads(e.read() or b"{}")
+                except ValueError:
+                    err = {}
+            if e.code == 401:
+                raise ChatError("the host rejected this invite (revoked or replaced). Ask the host for a new one.") from None
+            raise ChatError(str(err.get("error") or f"HTTP {e.code} from the host"), int(err.get("code") or EXIT_ERROR)) from None
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            raise ChatError(f"can't reach the host at {self.url} ({getattr(e, 'reason', e)}). "
+                            "Is `achat serve --host ...` running there, and are you on the same Tailscale network?") from None
+
+    @property
+    def config(self) -> Config:
+        if self._config is None:
+            j, _ = self._call("GET", "room")
+            self._config = Config(topic=j.get("topic", ""), participants=tuple(j["participants"]), max_turns=int(j["max_turns"]),
+                                  max_chars=int(j["max_chars"]), created=j.get("created", ""), brief=j.get("brief", ""),
+                                  max_attachment_bytes=int(j.get("max_attachment_bytes", DEFAULT_MAX_ATTACHMENT_BYTES)),
+                                  format=int(j.get("format", 2)))
+        return self._config
+
+    def messages(self) -> List[Message]:
+        j, etag = self._call("GET", "messages", etag=self._etag)
+        if j is not None:
+            self._msgs = [Message(seq=int(m["seq"]), sender=m["from"], ts=m.get("ts", ""), end=m.get("end_kind", ""), body=m["body"],
+                                  attachments=parse_attachments(json.dumps(m.get("attachments") or [])), id=m["id"])
+                          for m in j["messages"]]
+            self._etag = etag
+        return list(self._msgs)
+
+    def sync_gap(self, msgs: Sequence[Message], now: Optional[float] = None) -> Optional[int]:
+        return None   # the host's numbering is authoritative: it is a single machine with a lock
+
+    def seen_ids(self, who: str) -> Set[str]:
+        j, _ = self._call("GET", "seen")
+        return set(j.get("seen", []))
+
+    def unseen(self, who: str, msgs: Sequence[Message]) -> List[Message]:
+        seen = self.seen_ids(who)
+        return [m for m in msgs if m.sender != who and m.id not in seen]
+
+    def mark_seen(self, who: str, msgs: Iterable[Message]) -> None:
+        ids = [m.id for m in msgs if m.id]
+        if ids:
+            self._call("POST", "seen", {"ids": ids})
+
+    def require_participant(self, who: str) -> str:
+        if who != self.me:
+            raise ChatError(f'this connection is an invite for "{self.me}" in room "{self.name}"; it can\'t act as "{who}"')
+        return who
+
+    def publish(self, sender: str, text: str, *, end: bool = False, hints: "Optional[Hints]" = None,
+                attachments: Sequence[Tuple[str, bytes]] = ()) -> Message:
+        self.require_participant(sender)
+        j, _ = self._call("POST", "send", {"text": text, "end": end, "client": "mcp",
+                                           "attachments": [{"name": n, "content_base64": base64.b64encode(d).decode("ascii")} for n, d in attachments]})
+        m = j["message"]
+        return Message(seq=int(m["seq"]), sender=m["from"], ts=m.get("ts", ""), end=m.get("end_kind", ""), body=m["body"],
+                       attachments=parse_attachments(json.dumps(m.get("attachments") or [])), id=m["id"])
+
+    def attachment_bytes(self, sha256: str) -> bytes:
+        if not SHA256_RE.match(sha256):
+            raise ChatError(f"invalid attachment id {sha256!r}")
+        if sha256 not in self._blobs:
+            self._blobs[sha256], _ = self._call("GET", f"attachments/{sha256}", raw=True)
+        return self._blobs[sha256]
+
+
+class LocalBackend:
+    """Rooms in a folder on this machine."""
+
+    remote = False
+
+    def __init__(self, root: Path):
+        self.root = root
+
+    def rooms(self) -> List[Room]:
+        return list_rooms(self.root)
+
+    def open(self, name: str) -> Room:
+        room = Room(self.root, name)
+        room.config
+        return room
+
+    def create(self, name: str, **kw: Any) -> Room:
+        return Room.create(self.root, name, **kw)
+
+    def onboarding(self, room: Room) -> List[str]:
+        return onboarding_lines(self.root, room)
+
+
+class RemoteBackend:
+    """The single room an invite gives access to, on another machine."""
+
+    remote = True
+
+    def __init__(self, invite: Dict[str, str]):
+        self.room = RemoteRoom(invite)
+
+    def rooms(self) -> List[Room]:
+        self.room.config
+        return [self.room]
+
+    def open(self, name: str) -> Room:
+        if name != self.room.name:
+            raise ChatError(f'this connection only reaches room "{self.room.name}" (invite for "{self.room.me}")')
+        self.room.config
+        return self.room
+
+    def create(self, name: str, **kw: Any) -> Room:
+        raise ChatError("rooms are created by the host; this is a remote connection to one room")
+
+    def onboarding(self, room: Room) -> List[str]:
+        return []
+
+
+def remotes_dir() -> Path:
+    return config_home() / "remotes"
+
+
+def load_remote(name: str) -> Dict[str, str]:
+    validate_name(name, "remote name")
+    path = remotes_dir() / f"{name}.json"
+    try:
+        return decode_invite(json.loads(path.read_text(encoding="utf-8"))["invite"])
+    except FileNotFoundError:
+        raise ChatError(f"no remote named {name!r}. Add one with: achat remote add <invite>") from None
+    except (ValueError, KeyError):
+        raise ChatError(f"{path} is damaged; add the invite again") from None
+
+
+def cmd_invite(args: argparse.Namespace) -> int:
+    root, room = open_room(args)
+    who = room.require_participant(args.who)
+    if args.revoke:
+        out(f'Invite for "{who}" in room "{room.name}" ' + ("revoked: it stops working now." if revoke_invite(room, who) else "didn't exist."))
+        return EXIT_OK
+    url = args.url
+    if not url:
+        ip = tailscale_ip()
+        if not ip:
+            raise ChatError("pass --url http://ADDRESS:PORT (the address your friend can reach, e.g. your Tailscale IP: `tailscale ip -4`)")
+        url = f"http://{ip}:{DEFAULT_PORT}"
+    code = encode_invite(url, room.name, who, create_invite(room, who))
+    out(
+        f'Invite for "{who}" in room "{room.name}" at {url}',
+        "",
+        "Send this code privately (it works like a password; anyone with it can speak as that participant):",
+        "",
+        code,
+        "",
+        "Your friend runs:",
+        f"  python3 achat.py remote add '{code[:24]}…'      (the whole code)",
+        "and follows the instructions it prints. Keep this machine serving while you chat:",
+        f"  {cmd_hint(root, 'serve')} --host tailscale",
+        "",
+        f"Revoke it any time: {cmd_hint(root, 'invite', room.name, who)} --revoke",
+    )
+    return EXIT_OK
+
+
+def cmd_remote(args: argparse.Namespace) -> int:
+    if args.action == "list":
+        d = remotes_dir()
+        names = sorted(p.stem for p in d.glob("*.json")) if d.is_dir() else []
+        for n in names:
+            try:
+                inv = load_remote(n)
+                out(f'{n:<20} room "{inv["room"]}" as "{inv["as"]}" at {inv["url"]}')
+            except ChatError as e:
+                out(f"{n:<20} {e}")
+        if not names:
+            out("No remotes yet. Add one with: achat remote add <invite>")
+        return EXIT_OK
+    if args.action == "remove":
+        if not args.value:
+            raise ChatError("which one? achat remote remove NAME")
+        path = remotes_dir() / f"{validate_name(args.value, 'remote name')}.json"
+        if path.exists():
+            path.unlink(); out(f"Removed remote {args.value}.")
+        else:
+            out(f"No remote named {args.value}.")
+        return EXIT_OK
+    # add
+    if not args.value:
+        raise ChatError("paste the invite: achat remote add achat1:…")
+    inv = decode_invite(args.value)
+    name = validate_name(args.name or inv["room"], "remote name")
+    room = RemoteRoom(inv)
+    cfg = room.config   # proves the address and the token work before saving anything
+    write_private(remotes_dir() / f"{name}.json", json.dumps({"invite": args.value.strip(), "added": now_iso()}) + "\n")
+    out(
+        f'Connected: room "{inv["room"]}" ({cfg.topic or "no topic"}) as "{inv["as"]}" at {inv["url"]}.',
+        f"Saved as remote '{name}' in {remotes_dir()} (readable only by you).",
+        "",
+        "Give your agent achat's MCP tools for this room, e.g. in Claude Code:",
+        f"  claude mcp add --scope user achat-{name} -- {self_cmd()} mcp --remote {name}",
+        "(Codex/Gemini/Cursor: same command and args in their MCP config.)",
+        "",
+        f'Then tell it: Join the achat room "{inv["room"]}" as "{inv["as"]}".',
+        "Allow it only the achat tools: messages from the other side are written by someone else's AI.",
+    )
     return EXIT_OK
 
 
@@ -1762,8 +2210,10 @@ class McpServer:
     A reader thread owns stdin, so `ping` and `notifications/cancelled` are handled even
     while a `wait` call blocks the worker. One session = one joined (room, participant)."""
 
-    def __init__(self, root: Path, wait_timeout: float = MCP_DEFAULT_WAIT, instream: Any = None, outstream: Any = None):
+    def __init__(self, root: Optional[Path], wait_timeout: float = MCP_DEFAULT_WAIT, instream: Any = None,
+                 outstream: Any = None, backend: Any = None):
         self.root = root
+        self.backend = backend or LocalBackend(root)   # RemoteBackend for `achat mcp --remote`
         self.wait_timeout = min(max(0.0, wait_timeout), MCP_MAX_WAIT)
         self.instream = instream if instream is not None else sys.stdin
         self.outstream = outstream if outstream is not None else sys.stdout
@@ -1915,7 +2365,7 @@ class McpServer:
                 )
             return self.room, self.me
         if isinstance(room_arg, str) and isinstance(name_arg, str) and room_arg and name_arg:
-            room = Room(self.root, room_arg)
+            room = self.backend.open(room_arg)
             self.room, self.me = room, room.require_participant(name_arg)  # implicit join
             return self.room, self.me
         raise ChatError(
@@ -1924,7 +2374,7 @@ class McpServer:
         )
 
     def _tool_list_rooms(self, args: Dict[str, Any], **_: Any) -> Reply:
-        rooms = list_rooms(self.root)
+        rooms = self.backend.rooms()
         if not rooms:
             return "There are no rooms yet. Create one with `create_room`.", None
         lines = []
@@ -1942,8 +2392,7 @@ class McpServer:
         name = args.get("name") if isinstance(args.get("name"), str) else _arg(args, "room")  # a ROOM name here
         if not isinstance(name, str) or not name.strip():
             raise ChatError("`name` (the new room's name) is required and must be a non-empty string")
-        room = Room.create(
-            self.root,
+        room = self.backend.create(
             name.strip(),
             topic=str(args.get("topic") or ""),
             participants=participants,
@@ -1956,14 +2405,14 @@ class McpServer:
             f"Created room '{room.name}': {' → '.join(cfg.participants)} · {cfg.max_turns} turns · {cfg.max_chars} chars/message.",
             "Tell your user how to bring the participants in:",
             "",
-            *onboarding_lines(self.root, room),
+            *self.backend.onboarding(room),
             "",
             "You have not joined it. If you are one of the participants, call `join` now.",
         ]
         return "\n".join(lines), None
 
     def _tool_join(self, args: Dict[str, Any], **_: Any) -> Reply:
-        room = Room(self.root, _str_arg(args, "room"))
+        room = self.backend.open(_str_arg(args, "room"))
         me = room.require_participant(_str_arg(args, "name"))
         self.room, self.me = room, me
         return protocol_text_mcp(room, me, self.wait_timeout), None
@@ -2074,8 +2523,14 @@ def cmd_mcp(args: argparse.Namespace) -> int:
         return EXIT_ERROR
     with contextlib.suppress(AttributeError, ValueError):
         sys.stdout.reconfigure(newline="\n")  # MCP frames are "\n"-delimited, also on Windows
-    print(f"achat MCP server {VERSION} · rooms in {root}", file=sys.stderr, flush=True)
-    return McpServer(root, wait_timeout=args.wait_timeout).serve()
+    backend = None
+    if args.remote:
+        inv = load_remote(args.remote)
+        backend = RemoteBackend(inv)
+        print(f'achat MCP server {VERSION} · remote room "{inv["room"]}" as "{inv["as"]}" at {inv["url"]}', file=sys.stderr, flush=True)
+    else:
+        print(f"achat MCP server {VERSION} · rooms in {root}", file=sys.stderr, flush=True)
+    return McpServer(root, wait_timeout=args.wait_timeout, backend=backend).serve()
 
 
 # --------------------------------------------------------------------------
@@ -2152,8 +2607,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reason", help="closing message")
     p.set_defaults(func=cmd_close)
 
-    p = sub.add_parser("serve", parents=[common], help="web viewer on http://127.0.0.1 (watch and interject)")
+    p = sub.add_parser("serve", parents=[common], help="web viewer on http://127.0.0.1 (watch and interject); hosts remote participants")
     p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    p.add_argument("--host", default="127.0.0.1",
+                   help="address to listen on for remote participants: 'tailscale' (recommended), an IP, or 0.0.0.0")
     p.add_argument("--open", action="store_true", help="open it in the browser")
     p.set_defaults(func=cmd_serve)
 
@@ -2172,7 +2629,20 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("mcp", parents=[common], help="run as an MCP server on stdio (your agent starts this)")
     p.add_argument("--wait-timeout", type=float, default=MCP_DEFAULT_WAIT,
                    help=f"default seconds the `wait` tool blocks (default {MCP_DEFAULT_WAIT:g}; keep it under your client's tool timeout)")
+    p.add_argument("--remote", metavar="NAME", help="serve a room hosted on another machine (see `achat remote add`)")
     p.set_defaults(func=cmd_mcp)
+
+    p = sub.add_parser("invite", parents=[in_room], help="invite an agent on another machine to speak as a participant")
+    p.add_argument("--as", dest="who", required=True, help="the participant the guest will speak as")
+    p.add_argument("--url", help="address the guest reaches this machine at (default: your Tailscale IP, port 8765)")
+    p.add_argument("--revoke", action="store_true", help="revoke this participant's invite")
+    p.set_defaults(func=cmd_invite)
+
+    p = sub.add_parser("remote", parents=[common], help="rooms hosted on other machines: add <invite> | list | remove NAME")
+    p.add_argument("action", choices=["add", "list", "remove"])
+    p.add_argument("value", nargs="?", help="the invite (add) or the remote's name (remove)")
+    p.add_argument("--name", help="name to save the remote as (default: the room's name)")
+    p.set_defaults(func=cmd_remote)
     return parser
 
 

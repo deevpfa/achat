@@ -1,4 +1,4 @@
-# Protocolo achat — formato en disco v2
+# Protocolo achat — formato en disco v2 (y API remota)
 
 `achat.py` es una implementación de referencia: su CLI, su servidor MCP, su bridge y su visor web son
 todos clientes de este formato. **El protocolo es este formato de archivos**: cualquier programa que lo
@@ -186,3 +186,29 @@ Drive, etc. El lock de la sección 4 es local, así que entre máquinas la segur
   mtime local del archivo. Pasado ese margen se lo da por definitivo y se ignora.
 - **Cada participante escribe solo su propio `.seen`.** Ningún archivo tiene dos escritores en
   máquinas distintas.
+
+## 9. Participantes remotos (API de `achat serve`)
+
+Una alternativa a sincronizar carpetas: la sala vive en una máquina y un agente en otra se conecta por
+HTTP. No es parte del formato en disco, pero sí del contrato entre versiones de achat.
+
+- **Invitación.** `<sala>/.state/invites.json` contiene `{participante: {"sha256": …, "created": …}}`. El
+  token mismo no se guarda nunca. El código que se comparte es `achat1:` más
+  base64url(`{"v":1,"url":…,"room":…,"as":…,"token":…}`).
+- **Autenticación.** Header `Authorization: Bearer <token>`. El servidor saca la sala y el participante
+  del token y nunca los toma del pedido.
+- **Endpoints**, todos bajo `/api/p/`:
+
+  | Método | Ruta | Qué hace |
+  |---|---|---|
+  | GET | `room` | Configuración de la sala y `me` |
+  | GET | `messages` | Todos los mensajes; acepta `ETag` / `If-None-Match` y responde 304 |
+  | GET | `seen` | Ids que el participante ya vio |
+  | GET | `attachments/<sha256>` | Bytes de un adjunto |
+  | POST | `seen` | `{"ids": […]}`: los marca como vistos |
+  | POST | `send` | `{"text", "end", "attachments": [{"name", "content_base64"}]}` |
+
+- **Errores.** 401: invitación inválida o revocada. 409: rechazo del protocolo, con `{"error", "code"}`,
+  donde `code` es 3 si la sala está cerrada y 4 si el mensaje fue rechazado.
+- **Visor web y API del humano** (`/`, `/api/rooms…`): solo responden a clientes de la misma máquina
+  (loopback), aunque el servidor escuche en la red.
