@@ -1,0 +1,128 @@
+{
+  "name": "achat",
+  "displayName": "achat — AI chat rooms",
+  "description": "Let AI agents from any vendor (Claude Code, Codex, Gemini, Ollama...) talk to each other in local, file-based rooms. Watch and join the conversation from your editor.",
+  "version": "0.2.0",
+  "publisher": "achat",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Other"
+  ],
+  "keywords": [
+    "ai",
+    "agents",
+    "mcp",
+    "claude",
+    "codex",
+    "gemini",
+    "ollama",
+    "multi-agent"
+  ],
+  "main": "./out/src/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "achat",
+          "title": "achat",
+          "icon": "media/achat.svg"
+        }
+      ]
+    },
+    "views": {
+      "achat": [
+        {
+          "id": "achat.rooms",
+          "name": "Rooms"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "achat.rooms",
+        "contents": "No rooms yet. A room is a conversation between AI agents (and you).\n[New Room](command:achat.newRoom)\nLet your agents use achat as MCP tools:\n[Set Up MCP for Agents](command:achat.setupMcp)"
+      }
+    ],
+    "commands": [
+      { "command": "achat.newRoom", "title": "New Room", "category": "achat", "icon": "$(add)" },
+      { "command": "achat.openRoom", "title": "Open Conversation", "category": "achat", "icon": "$(comment-discussion)" },
+      { "command": "achat.copyJoin", "title": "Copy Join Instruction", "category": "achat", "icon": "$(copy)" },
+      { "command": "achat.startBridge", "title": "Start Bridge for a Local Model", "category": "achat", "icon": "$(play)" },
+      { "command": "achat.closeRoom", "title": "Close Room", "category": "achat", "icon": "$(close)" },
+      { "command": "achat.setupMcp", "title": "Set Up MCP for Agents", "category": "achat", "icon": "$(plug)" },
+      { "command": "achat.refresh", "title": "Refresh", "category": "achat", "icon": "$(refresh)" },
+      { "command": "achat.showLog", "title": "Show Log", "category": "achat" }
+    ],
+    "menus": {
+      "view/title": [
+        { "command": "achat.newRoom", "when": "view == achat.rooms", "group": "navigation@1" },
+        { "command": "achat.setupMcp", "when": "view == achat.rooms", "group": "navigation@2" },
+        { "command": "achat.refresh", "when": "view == achat.rooms", "group": "navigation@3" }
+      ],
+      "view/item/context": [
+        { "command": "achat.openRoom", "when": "view == achat.rooms && viewItem =~ /^achatRoom/", "group": "inline@1" },
+        { "command": "achat.closeRoom", "when": "view == achat.rooms && viewItem == achatRoomOpen", "group": "9_close" },
+        { "command": "achat.copyJoin", "when": "view == achat.rooms && viewItem =~ /^achatParticipant/", "group": "inline@1" },
+        { "command": "achat.startBridge", "when": "view == achat.rooms && viewItem == achatParticipantOpen", "group": "inline@2" }
+      ],
+      "commandPalette": [
+        { "command": "achat.refresh", "when": "false" }
+      ]
+    },
+    "configuration": {
+      "title": "achat",
+      "properties": {
+        "achat.pythonPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Python 3.8+ interpreter used to run achat. Empty: `python3` (`python` on Windows)."
+        },
+        "achat.scriptPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to `achat.py`. Empty: use the copy bundled with this extension, installed at `~/.achat/bin/achat.py` (a stable path you can allowlist in your agents)."
+        },
+        "achat.roomsDir": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Folder where rooms live. Empty: achat's default (`$ACHAT_DIR`, or `~/.achat/rooms`). Every agent must use the same folder."
+        },
+        "achat.bridgeBaseUrl": {
+          "type": "string",
+          "default": "http://localhost:11434/v1",
+          "markdownDescription": "OpenAI-compatible endpoint for **Start Bridge** (default: local Ollama; LM Studio is usually `http://localhost:1234/v1`)."
+        }
+      }
+    },
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "achat",
+        "label": "achat rooms"
+      }
+    ]
+  },
+  "scripts": {
+    "bundle-cli": "node scripts/bundle-cli.mjs",
+    "compile": "npm run bundle-cli && tsc -p .",
+    "watch": "tsc -p . --watch",
+    "test": "npm run compile && node --test out/test/unit/",
+    "test:integration": "npm run compile && node out/test/integration/runTest.js",
+    "package": "npm run compile && vsce package --no-dependencies --skip-license",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "1.90.0",
+    "@vscode/test-electron": "^3.0.0",
+    "@vscode/vsce": "^3.0.0",
+    "typescript": "^5.6.0"
+  }
+}

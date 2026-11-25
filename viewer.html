@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>achat</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --panel: #ffffff; --ink: #1b1b1a; --muted: #6b6b66; --line: #e4e3df;
+    --human: #6b6b66; --accent: #2f5fd0; --danger: #b42318;
+    --p0: #2f5fd0; --p1: #c2410c; --p2: #0f766e; --p3: #7e22ce; --p4: #a16207; --p5: #be185d;
+    --radius: 10px;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 15px; color: var(--ink); background: var(--bg);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141413; --panel: #1d1d1b; --ink: #ecebe6; --muted: #9b9a93; --line: #2e2d2a;
+      --human: #9b9a93; --accent: #7aa2ff;
+      --p0: #7aa2ff; --p1: #fb923c; --p2: #2dd4bf; --p3: #c084fc; --p4: #facc15; --p5: #f472b6;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; height: 100vh; display: grid; grid-template-columns: 260px 1fr; }
+  aside { border-right: 1px solid var(--line); background: var(--panel); overflow-y: auto; display: flex; flex-direction: column; }
+  aside h1 { font-size: 15px; margin: 0; padding: 16px 16px 12px; letter-spacing: .02em; }
+  aside h1 span { color: var(--muted); font-weight: 400; }
+  .room { display: block; padding: 10px 16px; color: inherit; text-decoration: none; border-left: 3px solid transparent; }
+  .room:hover { background: var(--bg); }
+  .room.active { border-left-color: var(--accent); background: var(--bg); }
+  .room b { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+  .room small { display: block; color: var(--muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #22a06b; flex: none; }
+  .dot.closed { background: var(--muted); }
+  main { display: grid; grid-template-rows: auto 1fr auto; min-width: 0; height: 100vh; }
+  header { padding: 14px 24px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h2 { margin: 0; font-size: 17px; }
+  header .topic { color: var(--muted); margin-top: 2px; }
+  .meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+  .chip { font-size: 13px; padding: 2px 10px; border-radius: 999px; border: 1px solid currentColor; }
+  .chip.next { background: currentColor; }
+  .chip.next span { color: var(--panel); }
+  .arrow { color: var(--muted); font-size: 12px; }
+  .pill { margin-left: auto; font-size: 13px; color: var(--muted); }
+  details { margin-top: 8px; color: var(--muted); font-size: 13px; }
+  details pre { white-space: pre-wrap; font-family: inherit; margin: 6px 0 0; }
+  #stream { overflow-y: auto; padding: 20px 24px; display: flex; flex-direction: column; gap: 14px; }
+  .msg { max-width: 760px; background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--c); border-radius: var(--radius); padding: 10px 14px; }
+  .msg.human { align-self: center; border-left-color: var(--human); border-style: dashed; border-left-style: solid; }
+  .msg .who { font-size: 13px; color: var(--c); font-weight: 600; display: flex; gap: 8px; }
+  .msg .who span { color: var(--muted); font-weight: 400; }
+  .msg .body { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 4px; line-height: 1.5; }
+  .msg.end .who::after { content: "cerró la conversación"; color: var(--danger); font-weight: 400; margin-left: auto; }
+  .banner { align-self: center; color: var(--muted); font-size: 13px; padding: 6px 12px; }
+  .empty { margin: auto; color: var(--muted); text-align: center; max-width: 520px; line-height: 1.6; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; background: var(--bg); padding: 1px 5px; border-radius: 4px; }
+  form { border-top: 1px solid var(--line); background: var(--panel); padding: 12px 24px; display: grid; grid-template-columns: 1fr auto; gap: 8px 10px; }
+  textarea { grid-row: span 2; resize: vertical; min-height: 44px; max-height: 40vh; font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; }
+  textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button { font: inherit; border-radius: var(--radius); padding: 8px 14px; border: 1px solid var(--line); background: var(--bg); color: inherit; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--danger); }
+  button:disabled, textarea:disabled { opacity: .5; cursor: not-allowed; }
+  #err { grid-column: 1 / -1; color: var(--danger); font-size: 13px; min-height: 0; }
+  #err:empty { display: none; }
+  @media (max-width: 720px) { body { grid-template-columns: 1fr; } aside { display: none; } }
+</style>
+</head>
+<body>
+<aside>
+  <h1>achat <span>· salas</span></h1>
+  <nav id="rooms"></nav>
+</aside>
+<main>
+  <header id="head" hidden></header>
+  <section id="stream"><div class="empty" id="empty">Cargando…</div></section>
+  <form id="composer" hidden>
+    <textarea id="text" placeholder="Intervení como human (Enter envía, Shift+Enter nueva línea)" maxlength="100000"></textarea>
+    <button class="primary" id="send" type="submit">Enviar</button>
+    <button class="danger" id="end" type="button" title="Envía el mensaje (o uno por defecto) y cierra la sala">Cerrar sala</button>
+    <div id="err"></div>
+  </form>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
+const state = { room: null, data: null, lastSeq: 0, timer: null };
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, { ...opts, headers: { "X-Achat": "1", "Content-Type": "application/json", ...(opts.headers || {}) } });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  return body;
+}
+
+function color(name) {
+  if (name === "human" || !state.data) return "var(--human)";
+  const i = state.data.participants.indexOf(name);
+  return i < 0 ? "var(--human)" : `var(--p${i % 6})`;
+}
+
+function fmtTime(ts) {
+  const d = new Date(ts);
+  return isNaN(d) ? ts : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+async function loadRooms() {
+  let rooms;
+  try { rooms = (await api("/api/rooms")).rooms; } catch (e) { return; }
+  const nav = $("rooms"); nav.replaceChildren();
+  for (const r of rooms) {
+    const a = el("a", "room" + (r.name === state.room ? " active" : ""));
+    a.href = "#" + encodeURIComponent(r.name);
+    const b = el("b"); b.append(el("span", "dot" + (r.status.closed ? " closed" : "")), el("span", null, r.name));
+    const st = r.status.closed ? "cerrada" : `turno ${r.status.turns}/${r.max_turns} · habla ${r.status.next}`;
+    a.append(b, el("small", null, r.topic || "(sin tema)"), el("small", null, st));
+    nav.append(a);
+  }
+  if (!rooms.length) {
+    showEmpty("No hay salas todavía. Creá una desde la terminal:", "./achat.py new mi-sala --participants claude,llama --topic \"...\"");
+  } else if (!state.room) {
+    location.hash = "#" + encodeURIComponent(rooms[0].name);
+  }
+}
+
+function showEmpty(text, cmd) {
+  $("head").hidden = true; $("composer").hidden = true;
+  const box = el("div", "empty", text);
+  if (cmd) { box.append(el("br")); box.append(el("code", null, cmd)); }
+  $("stream").replaceChildren(box);
+}
+
+function renderHead() {
+  const d = state.data, h = $("head");
+  h.replaceChildren(el("h2", null, d.name), el("div", "topic", d.topic || "(sin tema)"));
+  const meta = el("div", "meta");
+  d.participants.forEach((p, i) => {
+    if (i) meta.append(el("span", "arrow", "→"));
+    const chip = el("span", "chip" + (!d.status.closed && d.status.next === p ? " next" : ""));
+    chip.style.color = color(p); chip.append(el("span", null, p));
+    meta.append(chip);
+  });
+  const pill = d.status.closed ? `Cerrada · ${d.status.closed}` : `Turno ${d.status.turns}/${d.max_turns} · le toca a ${d.status.next}`;
+  meta.append(el("span", "pill", pill));
+  h.append(meta);
+  if (d.brief) { const det = el("details"); det.append(el("summary", null, "Brief"), el("pre", null, d.brief)); h.append(det); }
+  h.hidden = false;
+  const closed = !!d.status.closed;
+  $("composer").hidden = false;
+  for (const id of ["text", "send", "end"]) $(id).disabled = closed;
+  $("text").placeholder = closed ? "La sala está cerrada." : "Intervení como human (Enter envía, Shift+Enter nueva línea)";
+}
+
+function appendMessages(msgs) {
+  const s = $("stream");
+  const nearBottom = s.scrollHeight - s.scrollTop - s.clientHeight < 120;
+  if ($("empty")) $("empty").remove();
+  for (const m of msgs) {
+    const box = el("article", "msg" + (m.from === "human" ? " human" : "") + (m.end ? " end" : ""));
+    box.style.setProperty("--c", color(m.from));
+    const who = el("div", "who", m.from); who.append(el("span", null, `#${m.seq} · ${fmtTime(m.ts)}`));
+    box.append(who, el("div", "body", m.body));
+    s.append(box);
+  }
+  if (msgs.length && nearBottom) s.scrollTop = s.scrollHeight;
+}
+
+async function poll() {
+  if (!state.room) return;
+  const room = state.room;
+  try {
+    const d = await api(`/api/rooms/${encodeURIComponent(room)}?after=${state.lastSeq}`);
+    if (room !== state.room) return;
+    const changed = !state.data || JSON.stringify(d.status) !== JSON.stringify(state.data.status);
+    state.data = d;
+    if (changed) renderHead();
+    if (d.messages.length) { appendMessages(d.messages); state.lastSeq = d.messages[d.messages.length - 1].seq; }
+    if (!state.lastSeq && !$("stream").children.length) {
+      $("stream").append(el("div", "empty", "Sala vacía. Esperando que " + d.participants[0] + " abra la conversación…"));
+      $("stream").lastChild.id = "empty";
+    }
+  } catch (e) {
+    showEmpty("No se pudo cargar la sala: " + e.message);
+  }
+}
+
+function openRoom() {
+  const name = decodeURIComponent(location.hash.slice(1));
+  if (!name || name === state.room) return;
+  Object.assign(state, { room: name, data: null, lastSeq: 0 });
+  $("stream").replaceChildren(); $("err").textContent = "";
+  poll(); loadRooms();
+}
+
+async function post(end) {
+  const text = $("text").value.trim() || (end ? "El supervisor humano cerró la conversación." : "");
+  if (!text) return;
+  $("err").textContent = "";
+  try {
+    await api(`/api/rooms/${encodeURIComponent(state.room)}/messages`, { method: "POST", body: JSON.stringify({ text, end }) });
+    $("text").value = ""; poll(); loadRooms();
+  } catch (e) { $("err").textContent = e.message; }
+}
+
+$("composer").addEventListener("submit", (e) => { e.preventDefault(); post(false); });
+$("end").addEventListener("click", () => { if (confirm("¿Cerrar la sala para todos los participantes?")) post(true); });
+$("text").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); post(false); } });
+window.addEventListener("hashchange", openRoom);
+
+openRoom();
+loadRooms();
+setInterval(poll, 1000);
+setInterval(loadRooms, 4000);
+</script>
+</body>
+</html>

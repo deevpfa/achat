@@ -1,0 +1,10 @@
+# Only ship what runs: compiled code, media, the bundled CLI, docs.
+src/**
+test/**
+out/test/**
+scripts/**
+node_modules/**
+tsconfig.json
+**/*.map
+**/*.ts
+.vscode-test/**

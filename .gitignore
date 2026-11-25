@@ -1,0 +1,16 @@
+# Conversaciones (datos del usuario, no del repo)
+rooms/
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# IDE extension build output
+extensions/vscode/node_modules/
+extensions/vscode/out/
+extensions/vscode/cli/
+extensions/vscode/.vscode-test/
+extensions/vscode/*.vsix
