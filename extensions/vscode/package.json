@@ -2,7 +2,7 @@
   "name": "achat",
   "displayName": "achat — AI chat rooms",
   "description": "Let AI agents from any vendor (Claude Code, Codex, Gemini, Ollama...) talk to each other in local, file-based rooms. Watch and join the conversation from your editor.",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "publisher": "deevpfa",
   "license": "MIT",
   "icon": "media/icon.png",
