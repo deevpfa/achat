@@ -217,6 +217,74 @@ class TestEndProposals(RoomTestCase):
         self.assertIn("STATUS: CLOSED — all participants agreed", out)
 
 
+class TestAttachments(RoomTestCase):
+    def test_stored_once_by_hash_and_read_back(self):
+        room = self.make_room()
+        m1 = room.publish(achat.HUMAN, "one", attachments=[("a.txt", b"same bytes")])
+        m2 = room.publish(achat.HUMAN, "two", attachments=[("b.txt", b"same bytes")])
+        self.assertEqual(m1.attachments[0].sha256, m2.attachments[0].sha256)
+        self.assertEqual(len(list((room.dir / "attachments").iterdir())), 1)  # deduplicated within the room
+        again = achat.Room(self.root, "r").messages()
+        self.assertEqual([(a.name, a.size, a.type) for m in again for a in m.attachments], [("a.txt", 10, "text/plain"), ("b.txt", 10, "text/plain")])
+        self.assertIn('\nattachments: [{"sha256": ', (room.msgs_dir / "000001-human.md").read_text(encoding="utf-8"))
+
+    def test_limits_and_names(self):
+        room = achat.Room.create(self.root, "r", topic="t", participants=["a", "b"], max_attachment_bytes=10)
+        for files in ([("x", b"")], [("big", b"x" * 11)], [(f"f{i}", b"x") for i in range(11)]):
+            with self.assertRaises(achat.ChatError):
+                room.publish(achat.HUMAN, "hi", attachments=files)
+        m = room.publish(achat.HUMAN, "hi", attachments=[("../../etc/passwd", b"root:x")])
+        self.assertEqual(m.attachments[0].name, "passwd")
+        self.assertTrue((room.dir / "attachments" / m.attachments[0].sha256).is_file())
+        self.assertFalse((self.root / "etc").exists())
+
+    def test_rejected_send_leaves_no_blob(self):
+        room = self.make_room()
+        with self.assertRaises(achat.ChatError):
+            room.publish("bob", "not my turn", attachments=[("a.txt", b"data")])
+        self.assertFalse((room.dir / "attachments").exists())
+
+    def test_cli_attach_preview_and_fetch(self):
+        self.make_room()
+        src = self.root / "notes.md"
+        src.write_text("\n".join(f"line {i}" for i in range(1, 31)) + "\n", encoding="utf-8")
+        binf = self.root / "blob.bin"
+        binf.write_bytes(bytes(range(256)))
+        code, out, err = self.run_cli("send", "--room", "r", "--as", "alice", "--attach", str(src), "--attach", str(binf), "two files")
+        self.assertEqual(code, 0, err)
+        code, out, _ = self.run_cli("wait", "--room", "r", "--as", "bob", "--timeout", "0")
+        self.assertIn("📎 notes.md · text/markdown", out)
+        self.assertIn("   ┆ line 20", out)
+        self.assertNotIn("line 21", out)
+        self.assertIn("… 10 more lines", out)
+        self.assertIn("attachment --dir", out)
+        m = achat.Room(self.root, "r").messages()[0]
+        code, out, _ = self.run_cli("attachment", "--room", "r", m.attachments[0].short_id[:8])
+        self.assertEqual((code, out), (0, src.read_text(encoding="utf-8")))
+        code, _, err = self.run_cli("attachment", "--room", "r", m.attachments[1].short_id)
+        self.assertEqual(code, achat.EXIT_ERROR)
+        self.assertIn("--out", err)
+        dest = self.root / "copy.bin"
+        self.assertEqual(self.run_cli("attachment", "--room", "r", "@attachment:" + m.attachments[1].short_id, "--out", str(dest))[0], 0)
+        self.assertEqual(dest.read_bytes(), bytes(range(256)))
+        for bad in ("zz", "1234", "deadbeefdeadbeef"):
+            self.assertEqual(self.run_cli("attachment", "--room", "r", bad)[0], achat.EXIT_ERROR, bad)
+
+    def test_json_has_previews(self):
+        room = self.make_room()
+        room.publish(achat.HUMAN, "see", attachments=[("a.py", b"print(1)\n")])
+        code, out, _ = self.run_cli("read", "--room", "r", "--json")
+        att = json.loads(out)["messages"][0]["attachments"][0]
+        self.assertEqual((att["name"], att["preview"], att["lines"]), ("a.py", "print(1)", 1))
+
+    def test_bridge_prompt_includes_small_text_files(self):
+        room = self.make_room(participants=("alice", "bot"))
+        room.publish("alice", "check this", attachments=[("x.txt", b"the content"), ("y.bin", bytes(range(256)))])
+        chat = achat.build_chat(room.config, room.messages(), "bot", room=room)
+        self.assertIn("[attached file x.txt]\nthe content", chat[-1]["content"])
+        self.assertIn("[attached file y.bin: application/octet-stream", chat[-1]["content"])
+
+
 class TestConcurrency(RoomTestCase):
     def test_parallel_processes_get_contiguous_unique_seqs(self):
         self.make_room()
@@ -496,6 +564,17 @@ class TestServer(RoomTestCase):
         self.assertEqual(self.request("/api/rooms/r/messages", json.dumps({"text": "a", "end": "false"}).encode(), hdrs)[0], 200)
         self.assertIsNone(achat.Room(self.root, "r").status().closed)
         self.assertEqual(self.request("/api/rooms/r/messages", json.dumps({"text": "b", "end": "maybe"}).encode(), hdrs)[0], 409)
+
+    def test_attachment_download_is_never_html(self):
+        m = achat.Room(self.root, "r").publish(achat.HUMAN, "x", attachments=[("evil.html", b"<script>alert(1)</script>")])
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}/api/rooms/r/attachments/{m.attachments[0].short_id}")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            self.assertEqual(resp.read(), b"<script>alert(1)</script>")
+            self.assertEqual(resp.headers["Content-Type"], "text/plain; charset=utf-8")
+            self.assertTrue(resp.headers["Content-Disposition"].startswith("attachment;"))
+            self.assertIn("sandbox", resp.headers["Content-Security-Policy"])
+            self.assertEqual(resp.headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(self.request("/api/rooms/r/attachments/deadbeefdeadbeef")[0], 404)
 
     def test_recreated_room_is_not_served_from_cache(self):
         achat.Room(self.root, "r").publish("alice", "old message")

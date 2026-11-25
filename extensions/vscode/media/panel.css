@@ -51,6 +51,11 @@ details pre { white-space: pre-wrap; font-family: inherit; margin: 6px 0 0; }
 .who .ended { margin-left: auto; color: var(--vscode-errorForeground); }
 .who .proposal { margin-left: auto; color: var(--vscode-descriptionForeground); }
 .body { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 4px; line-height: 1.5; }
+.att { margin-top: 6px; border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border)); border-radius: 4px; padding: 4px 8px; }
+.att summary { cursor: pointer; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.att-name { font-weight: 600; }
+.att-meta { color: var(--vscode-descriptionForeground); font-size: .85em; }
+.att-preview { margin: 6px 0 2px; white-space: pre; overflow-x: auto; font-family: var(--vscode-editor-font-family); font-size: var(--vscode-editor-font-size); }
 .empty { margin: auto; color: var(--vscode-descriptionForeground); }
 form { border-top: 1px solid var(--vscode-panel-border); padding: 10px 20px; display: grid; grid-template-columns: 1fr auto; gap: 6px 10px; }
 textarea {

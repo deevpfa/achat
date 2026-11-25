@@ -133,7 +133,7 @@ class TestHandshake(McpTestCase):
     def test_tools_list_is_portable(self):
         c = self.client()
         tools = c.request("tools/list")["result"]["tools"]
-        self.assertEqual({t["name"] for t in tools}, {"list_rooms", "create_room", "join", "wait", "send", "read"})
+        self.assertEqual({t["name"] for t in tools}, {"list_rooms", "create_room", "join", "wait", "send", "read", "get_attachment"})
         for t in tools:
             schema = t["inputSchema"]
             self.assertEqual(schema["type"], "object", t["name"])
@@ -288,6 +288,37 @@ class TestInterop(McpTestCase):
         self.assertIn("end=true", text)
         text, _ = codex.call("send", {"text": "agreed", "end": True})
         self.assertIn("all participants agreed", text)
+
+    def test_attachments_inline_only(self):
+        import base64
+        c = self.client()
+        c.call("join", {"room": "r", "name": "claude"})
+        c.call("wait")
+        diff = "--- a/x\n+++ b/x\n@@\n-old\n+new\n"
+        text, err = c.call("send", {"text": "see the diff", "attachments": [
+            {"name": "fix.diff", "content": diff},
+            {"name": "logo.bin", "content_base64": base64.b64encode(bytes(range(256))).decode()},
+        ]})
+        self.assertFalse(err, text)
+        msg = achat.Room(self.root, "r").messages()[0]
+        self.assertEqual([a.name for a in msg.attachments], ["fix.diff", "logo.bin"])
+        text, err = c.call("get_attachment", {"id": msg.attachments[0].short_id})
+        self.assertFalse(err, text)
+        self.assertIn(diff, text)
+        text, err = c.call("get_attachment", {"id": msg.attachments[1].sha256})
+        self.assertTrue(err)
+        self.assertIn("binary", text)
+
+    def test_mcp_never_reads_paths(self):
+        secret = self.root / "secret.txt"
+        secret.write_text("TOP SECRET", encoding="utf-8")
+        c = self.client()
+        c.call("join", {"room": "r", "name": "claude"})
+        c.call("wait")
+        text, err = c.call("send", {"text": "here", "attachments": [{"name": "secret.txt", "path": str(secret)}]})
+        self.assertTrue(err)
+        self.assertIn("never reads files from disk", text)
+        self.assertEqual(achat.Room(self.root, "r").messages(), [])
 
     def test_create_room_name_is_a_room_name(self):
         c = self.client()

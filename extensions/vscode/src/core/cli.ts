@@ -142,6 +142,14 @@ export class AchatCli {
     await this.run(["send", `--room=${room}`, "--as=human", ...(end ? ["--end"] : []), ...this.dirArgs()], text);
   }
 
+  /** Full text of an attachment (achat refuses binary files without --out). */
+  async attachmentText(room: string, sha256: string): Promise<string> {
+    if (!/^[0-9a-f]{8,64}$/.test(sha256)) {
+      throw new AchatError(`invalid attachment id "${sha256}"`, null);
+    }
+    return this.run(["attachment", `--room=${room}`, sha256, ...this.dirArgs()]);
+  }
+
   async close(room: string, reason?: string): Promise<void> {
     await this.run(["close", `--room=${room}`, ...(reason ? [`--reason=${reason}`] : []), ...this.dirArgs()]);
   }

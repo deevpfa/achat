@@ -64,6 +64,29 @@
     $("text").placeholder = closed ? "This room is closed." : "Interject as human (Enter sends, Shift+Enter for a new line)";
   }
 
+  function fmtSize(n) {
+    return n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`;
+  }
+
+  function attachmentEl(a) {
+    const box = el("details", "att");
+    const sum = el("summary");
+    sum.append(el("span", "att-name", "📎 " + a.name), el("span", "att-meta", `${a.type} · ${fmtSize(a.size)} · id ${a.sha256.slice(0, 12)}`));
+    if (a.preview !== null) {
+      const open = el("button", "link", "open");
+      open.title = "Open the full file in an editor tab";
+      open.addEventListener("click", (e) => { e.preventDefault(); vscode.postMessage({ type: "openAttachment", sha256: a.sha256, name: a.name }); });
+      sum.append(open);
+    }
+    box.append(sum);
+    if (a.preview !== null) {
+      box.append(el("pre", "att-preview", a.preview + (a.lines > 20 ? `\n… ${a.lines - 20} more lines` : "")));
+    } else {
+      box.append(el("div", "att-meta", "Binary file: no preview."));
+    }
+    return box;
+  }
+
   function appendMessages(msgs, reset) {
     const s = $("stream");
     const nearBottom = s.scrollHeight - s.scrollTop - s.clientHeight < 120;
@@ -78,6 +101,7 @@
       if (m.end) who.append(el("span", "ended", "closed the conversation"));
       else if (m.end_proposal) who.append(el("span", "proposal", "proposes to end"));
       box.append(who, el("div", "body", m.body));
+      for (const a of m.attachments || []) box.append(attachmentEl(a));
       s.append(box);
     }
     if (!s.children.length) {

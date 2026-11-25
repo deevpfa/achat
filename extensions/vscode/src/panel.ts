@@ -10,6 +10,7 @@ type FromWebview =
   | { type: "send"; text: string; end: boolean }
   | { type: "copy"; participant: string; kind: "shell" | "mcp" }
   | { type: "bridge"; participant: string }
+  | { type: "openAttachment"; sha256: string; name: string }
   | { type: "rendered"; messages: number }
   | { type: "webviewError"; message: string };
 
@@ -31,6 +32,10 @@ function parseFromWebview(m: unknown): FromWebview | undefined {
         : undefined;
     case "bridge":
       return typeof o.participant === "string" ? { type: "bridge", participant: o.participant } : undefined;
+    case "openAttachment":
+      return typeof o.sha256 === "string" && /^[0-9a-f]{64}$/.test(o.sha256) && typeof o.name === "string"
+        ? { type: "openAttachment", sha256: o.sha256, name: o.name }
+        : undefined;
     case "rendered":
       return typeof o.messages === "number" ? { type: "rendered", messages: o.messages } : undefined;
     case "webviewError":
@@ -171,6 +176,14 @@ export class ConversationPanel implements vscode.Disposable {
             ? `Copied. Paste it into ${m.participant}'s chat (an agent with achat's MCP server).`
             : `Copied. Paste it into ${m.participant}'s chat (an agent with a terminal: Claude Code, Codex, Gemini CLI...).`,
         );
+      }
+    } else if (m.type === "openAttachment") {
+      try {
+        const content = await this.state.requireCli().attachmentText(this.room, m.sha256);
+        const doc = await vscode.workspace.openTextDocument({ content });
+        await vscode.window.showTextDocument(doc, { viewColumn: vscode.ViewColumn.Beside, preview: true });
+      } catch (e) {
+        void vscode.window.showErrorMessage(`achat: can't open ${m.name}: ${e instanceof Error ? e.message : String(e)}`);
       }
     } else if (m.type === "bridge") {
       await vscode.commands.executeCommand("achat.startBridge", this.room, m.participant);

@@ -10,6 +10,16 @@ export interface RoomStatus {
   end_proposed_by: string[];
 }
 
+export interface AttachmentInfo {
+  sha256: string;
+  name: string;
+  size: number;
+  type: string;
+  /** First lines of a text file; null for binary files. */
+  preview: string | null;
+  lines: number | null;
+}
+
 export interface ChatMessage {
   seq: number;
   from: string;
@@ -18,6 +28,7 @@ export interface ChatMessage {
   /** An agent proposed ending with this message (achat ≥ 0.3). */
   end_proposal: boolean;
   body: string;
+  attachments: AttachmentInfo[];
 }
 
 export interface Onboarding {
@@ -103,6 +114,18 @@ function parseMessage(v: unknown): ChatMessage {
     end: m.end === true,
     end_proposal: m.end_proposal === true,
     body: need(typeof m.body === "string", "message.body", m.body as string),
+    attachments: (Array.isArray(m.attachments) ? m.attachments : []).filter(isObj).flatMap((a) =>
+      typeof a.sha256 === "string" && /^[0-9a-f]{64}$/.test(a.sha256) && typeof a.name === "string" && typeof a.size === "number"
+        ? [{
+            sha256: a.sha256,
+            name: a.name,
+            size: a.size,
+            type: typeof a.type === "string" ? a.type : "application/octet-stream",
+            preview: typeof a.preview === "string" ? a.preview : null,
+            lines: typeof a.lines === "number" ? a.lines : null,
+          }]
+        : [],
+    ),
   };
 }
 

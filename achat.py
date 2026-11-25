@@ -12,8 +12,11 @@ Python 3.8+, standard library only.
 """
 
 import argparse
+import base64
 import contextlib
+import hashlib
 import json
+import mimetypes
 import os
 import re
 import queue
@@ -46,6 +49,11 @@ DEFAULT_TIMEOUT = 90.0
 DEFAULT_MAX_TURNS = 20
 DEFAULT_MAX_CHARS = 6000
 DEFAULT_PORT = 8765
+DEFAULT_MAX_ATTACHMENT_BYTES = 1_000_000
+MAX_ATTACHMENTS_PER_MESSAGE = 10
+PREVIEW_LINES = 20
+PREVIEW_LINE_CHARS = 200
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 POLL_INTERVAL = 0.5
 LOCK_TIMEOUT = 15.0
 
@@ -119,11 +127,15 @@ def dump_doc(meta: Dict[str, object], body: str) -> str:
 
 def atomic_write(path: Path, text: str) -> None:
     """Write via temp file + rename, so readers never see a partial file."""
+    atomic_write_bytes(path, text.replace("\r\n", "\n").encode("utf-8"))
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.parent / f".tmp-{uuid.uuid4().hex}"
     try:
-        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-            f.write(text)
+        with open(tmp, "wb") as f:
+            f.write(data)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
@@ -131,6 +143,31 @@ def atomic_write(path: Path, text: str) -> None:
         with contextlib.suppress(FileNotFoundError):
             tmp.unlink()
         raise
+
+
+def human_size(n: int) -> str:
+    for unit in ("B", "KB", "MB"):
+        if n < 1024 or unit == "MB":
+            return f"{n} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024  # type: ignore[assignment]
+    return f"{n} B"
+
+
+def decode_text(data: bytes) -> Optional[str]:
+    """The content as text, or None if it's binary (not UTF-8, or contains NUL bytes)."""
+    if b"\x00" in data:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def clean_filename(name: str) -> str:
+    """Display name only (the file on disk is named by its hash): basename, printable, short."""
+    base = re.split(r"[\\/]", name)[-1]
+    base = "".join(ch for ch in base if ch.isprintable()).strip().strip(".")
+    return (base or "attachment")[:128]
 
 
 if os.name == "nt":  # pragma: no cover - exercised on Windows only
@@ -213,6 +250,42 @@ class Config:
     max_chars: int
     created: str
     brief: str
+    max_attachment_bytes: int = DEFAULT_MAX_ATTACHMENT_BYTES
+
+
+@dataclass(frozen=True)
+class Attachment:
+    """A file shared with a message. Stored once per room under its SHA-256."""
+
+    sha256: str
+    name: str
+    size: int
+    type: str
+
+    @property
+    def short_id(self) -> str:
+        return self.sha256[:12]
+
+    def to_meta(self) -> Dict[str, object]:
+        return {"sha256": self.sha256, "name": self.name, "size": self.size, "type": self.type}
+
+
+def parse_attachments(raw: str) -> Tuple[Attachment, ...]:
+    try:
+        items = json.loads(raw) if raw else []
+    except ValueError:
+        return ()
+    out = []
+    for it in items if isinstance(items, list) else []:
+        if (
+            isinstance(it, dict)
+            and isinstance(it.get("sha256"), str) and SHA256_RE.match(it["sha256"])
+            and isinstance(it.get("name"), str)
+            and isinstance(it.get("size"), int)
+            and isinstance(it.get("type"), str)
+        ):
+            out.append(Attachment(it["sha256"], clean_filename(it["name"]), it["size"], it["type"]))
+    return tuple(out)
 
 
 END_NOW = "true"  # closes the room at once: the human's close (and agents of older clients)
@@ -226,6 +299,7 @@ class Message:
     ts: str
     end: str  # "", END_PROPOSE or END_NOW
     body: str
+    attachments: Tuple[Attachment, ...] = ()
 
     def to_json(self) -> Dict[str, object]:
         return {
@@ -235,6 +309,7 @@ class Message:
             "end": self.end == END_NOW,
             "end_proposal": self.end == END_PROPOSE,
             "body": self.body,
+            "attachments": [a.to_meta() for a in self.attachments],
         }
 
 
@@ -313,6 +388,7 @@ class Room:
         max_turns: int = DEFAULT_MAX_TURNS,
         max_chars: int = DEFAULT_MAX_CHARS,
         brief: str = "",
+        max_attachment_bytes: int = DEFAULT_MAX_ATTACHMENT_BYTES,
     ) -> "Room":
         room = cls(root, name)
         parts = [p.strip() for p in participants if p.strip()]
@@ -324,7 +400,7 @@ class Room:
                 raise ChatError(f"'{HUMAN}' is reserved for the person supervising the room")
         if len(set(parts)) != len(parts):
             raise ChatError("participant names must be unique")
-        if max_turns < 1 or max_chars < 1:
+        if max_turns < 1 or max_chars < 1 or max_attachment_bytes < 0:
             raise ChatError("--max-turns and --max-chars must be positive")
         root.mkdir(parents=True, exist_ok=True)
         try:
@@ -339,6 +415,7 @@ class Room:
             "participants": ", ".join(parts),
             "max_turns": max_turns,
             "max_chars": max_chars,
+            "max_attachment_bytes": max_attachment_bytes,
             "created": now_iso(),
         }
         brief = brief.strip()
@@ -361,6 +438,7 @@ class Room:
                     max_chars=int(meta.get("max_chars", DEFAULT_MAX_CHARS)),
                     created=meta.get("created", ""),
                     brief=body.strip(),
+                    max_attachment_bytes=int(meta.get("max_attachment_bytes", DEFAULT_MAX_ATTACHMENT_BYTES)),
                 )
             except (KeyError, ValueError) as e:
                 raise ChatError(f"{path} is malformed ({e})") from None
@@ -392,7 +470,53 @@ class Room:
             ts=meta.get("ts", ""),
             end={"true": END_NOW, "propose": END_PROPOSE}.get(meta.get("end", "").strip().lower(), ""),
             body=body.rstrip("\n"),
+            attachments=parse_attachments(meta.get("attachments", "")),
         )
+
+    # -- attachments ----------------------------------------------------------
+
+    @property
+    def attachments_dir(self) -> Path:
+        return self.dir / "attachments"
+
+    def attachment_bytes(self, sha256: str) -> bytes:
+        if not SHA256_RE.match(sha256):
+            raise ChatError(f"invalid attachment id {sha256!r}")
+        try:
+            return (self.attachments_dir / sha256).read_bytes()
+        except FileNotFoundError:
+            raise ChatError(f"attachment {sha256[:12]} is missing from room {self.name!r}") from None
+
+    def attachment_preview(self, a: Attachment) -> Optional[Tuple[str, int]]:
+        """First PREVIEW_LINES lines (each capped) and the total line count; None for binary."""
+        try:
+            text = decode_text(self.attachment_bytes(a.sha256))
+        except ChatError:
+            return None
+        if text is None:
+            return None
+        lines = text.splitlines()
+        shown = [ln if len(ln) <= PREVIEW_LINE_CHARS else ln[: PREVIEW_LINE_CHARS - 1] + "…" for ln in lines[:PREVIEW_LINES]]
+        return "\n".join(shown), len(lines)
+
+    def find_attachment(self, ref: str) -> Attachment:
+        """Resolve an id as agents write it: full hash, a prefix of 8+ hex chars, `@attachment:…`."""
+        key = ref.strip().lower()
+        for prefix in ("@attachment:", "attachment:", "sha256:"):
+            if key.startswith(prefix):
+                key = key[len(prefix):]
+        if not re.fullmatch(r"[0-9a-f]{8,64}", key):
+            raise ChatError(f"{ref!r} is not an attachment id (use the id shown next to the 📎, 8+ hex characters)")
+        found: Dict[str, Attachment] = {}
+        for m in self.messages():
+            for a in m.attachments:
+                if a.sha256.startswith(key):
+                    found.setdefault(a.sha256, a)
+        if not found:
+            raise ChatError(f"no attachment {key} in room {self.name!r}")
+        if len(found) > 1:
+            raise ChatError(f"attachment id {key} is ambiguous; use more characters")
+        return next(iter(found.values()))
 
     def status(self, msgs: Optional[Sequence[Message]] = None) -> Status:
         return compute_status(self.config, self.messages() if msgs is None else msgs)
@@ -415,7 +539,15 @@ class Room:
             )
         return who
 
-    def publish(self, sender: str, text: str, *, end: bool = False, hints: "Optional[Hints]" = None) -> Message:
+    def publish(
+        self,
+        sender: str,
+        text: str,
+        *,
+        end: bool = False,
+        hints: "Optional[Hints]" = None,
+        attachments: Sequence[Tuple[str, bytes]] = (),
+    ) -> Message:
         """Append one message. All checks run under the lock, so they can't go stale."""
         cfg = self.config
         hints = hints or CliHints(self.root, self.name, sender)
@@ -427,9 +559,19 @@ class Room:
         if len(body) > cfg.max_chars:
             raise ChatError(
                 f"the message has {len(body)} characters; this room allows {cfg.max_chars}. "
-                "Shorten it and send again.",
+                "Shorten it (attachments don't count toward this limit) and send again.",
                 EXIT_REJECTED,
             )
+        if len(attachments) > MAX_ATTACHMENTS_PER_MESSAGE:
+            raise ChatError(f"at most {MAX_ATTACHMENTS_PER_MESSAGE} attachments per message", EXIT_REJECTED)
+        for name, data in attachments:
+            if not data:
+                raise ChatError(f"attachment {name!r} is empty", EXIT_REJECTED)
+            if len(data) > cfg.max_attachment_bytes:
+                raise ChatError(
+                    f"attachment {name!r} is {human_size(len(data))}; this room allows {human_size(cfg.max_attachment_bytes)} per file",
+                    EXIT_REJECTED,
+                )
         with file_lock(self.dir / ".lock"):
             msgs = self.messages()
             st = compute_status(cfg, msgs)
@@ -454,9 +596,21 @@ class Room:
             kind = (END_NOW if sender == HUMAN else END_PROPOSE) if end else ""
             if kind:
                 meta["end"] = kind
+            atts = []
+            for name, data in attachments:  # blobs first: a visible message never points at a missing file
+                sha = hashlib.sha256(data).hexdigest()
+                if not (self.attachments_dir / sha).exists():  # content-addressed: stored once per room
+                    atomic_write_bytes(self.attachments_dir / sha, data)
+                fname = clean_filename(name)
+                guessed = mimetypes.guess_type(fname)[0]
+                is_text = decode_text(data) is not None
+                ctype = guessed if guessed and (is_text or not guessed.startswith("text/")) else ("text/plain" if is_text else "application/octet-stream")
+                atts.append(Attachment(sha, fname, len(data), ctype))
+            if atts:
+                meta["attachments"] = json.dumps([a.to_meta() for a in atts], ensure_ascii=False)
             final = self.msgs_dir / f"{seq:06d}-{sender}.md"
             atomic_write(final, dump_doc(meta, body + "\n"))
-            msg = Message(seq=seq, sender=sender, ts=str(meta["ts"]), end=kind, body=body)
+            msg = Message(seq=seq, sender=sender, ts=str(meta["ts"]), end=kind, body=body, attachments=tuple(atts))
             self._cache[final.name] = msg
         if sender != HUMAN:
             self.set_cursor(sender, seq)
@@ -544,6 +698,9 @@ class Hints:
     def send(self) -> str:
         raise NotImplementedError
 
+    def attachment(self) -> str:
+        raise NotImplementedError
+
 
 class CliHints(Hints):
     def __init__(self, root: Path, room: str, who: str):
@@ -559,6 +716,9 @@ class CliHints(Hints):
     def send(self) -> str:
         return f"Reply with one single-quoted argument:\n{send_block(self.root, self.room, self.who)}"
 
+    def attachment(self) -> str:
+        return f"Full content of an attachment: {cmd_hint(self.root, 'attachment', self.room)} <id>"
+
 
 class McpHints(Hints):
     end_flag = "end=true"
@@ -571,11 +731,25 @@ class McpHints(Hints):
     def send(self) -> str:
         return "Reply by calling the `send` tool with your message."
 
+    def attachment(self) -> str:
+        return "Full content of an attachment: call the `get_attachment` tool with its id."
 
-def fmt_message(m: Message) -> str:
+
+def fmt_message(m: Message, room: "Optional[Room]" = None, hints: "Optional[Hints]" = None) -> str:
     ts = m.ts.replace("T", " ")
     flag = {END_NOW: " · ENDED THE CONVERSATION", END_PROPOSE: " · PROPOSES TO END"}.get(m.end, "")
-    return f"──── #{m.seq} · {m.sender} · {ts}{flag} ────\n{m.body}\n"
+    lines = [f"──── #{m.seq} · {m.sender} · {ts}{flag} ────", m.body]
+    for a in m.attachments:
+        lines.append(f"📎 {a.name} · {a.type} · {human_size(a.size)} · id {a.short_id}")
+        preview = room.attachment_preview(a) if room is not None else None
+        if preview is not None:
+            text, total = preview
+            lines += ["   ┆ " + ln for ln in text.split("\n")]
+            if total > PREVIEW_LINES:
+                lines.append(f"   ┆ … {total - PREVIEW_LINES} more lines")
+    if m.attachments and hints is not None:
+        lines.append(hints.attachment())
+    return "\n".join(lines) + "\n"
 
 
 def summary(cfg: Config, st: Status) -> str:
@@ -651,6 +825,9 @@ def protocol_text(root: Path, room: Room, me: str) -> str:
         "   reply means \"let's go on\" and withdraws the proposal.",
         "",
         "3) Go back to step 1.",
+        "",
+        "To share a file (code, a diff, a log), add --attach PATH (repeatable). Others get a 20-line preview",
+        f"and fetch it in full with: {cmd_hint(root, 'attachment', room.name)} <id>",
     ]
     lines += loop_rules(me, "run the same wait command again.", f"run `{read}`")
     lines += [
@@ -672,6 +849,9 @@ def protocol_text_mcp(room: Room, me: str, wait_timeout: float) -> str:
         "   PROPOSE ending it: the room closes once every participant has agreed (each sends end=true in their",
         "   turn); a normal reply means \"let's go on\" and withdraws the proposal.",
         "3) Go back to step 1.",
+        "",
+        "To share a file (code, a diff, a log), pass `attachments` to `send` with the content inline. Others",
+        "get a 20-line preview and fetch it in full with `get_attachment`.",
     ]
     lines += loop_rules(me, "call `wait` again.", "call `read`")
     lines += status_footer(room, me, "Next: call the `wait` tool.")
@@ -711,8 +891,9 @@ def await_turn(
         time.sleep(POLL_INTERVAL)
 
 
-def render_delivery(d: Delivery, cfg: Config, hints: Hints, timeout: Optional[float] = None) -> str:
-    parts = [fmt_message(m) for m in d.messages]
+def render_delivery(d: Delivery, room: "Room", hints: Hints, timeout: Optional[float] = None) -> str:
+    cfg = room.config
+    parts = [fmt_message(m, room, hints) for m in d.messages]
     st = d.status
     if d.state == "closed":
         parts.append(f"STATUS: CLOSED — {st.closed}. The conversation is over: stop and summarize it for your user.")
@@ -758,8 +939,9 @@ def turn_line(cfg: Config, st: Status, me: str, hints: Hints) -> str:
     return f"Not your turn ({st.next_speaker} is next). {hints.wait()}"
 
 
-def render_read(shown: Sequence[Message], cfg: Config, st: Status, me: str, hints: Hints) -> str:
-    parts = [fmt_message(m) for m in shown] or ["(No new messages since you last read.)"]
+def render_read(shown: Sequence[Message], room: "Room", st: Status, me: str, hints: Hints) -> str:
+    cfg = room.config
+    parts = [fmt_message(m, room, hints) for m in shown] or ["(No new messages since you last read.)"]
     return "\n".join(parts + [turn_line(cfg, st, me, hints)])
 
 
@@ -860,7 +1042,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
     root, room = open_room(args)
     me = room.require_participant(args.who)
     d = await_turn(room, me, args.timeout)
-    out(render_delivery(d, room.config, CliHints(root, room.name, me), args.timeout))
+    out(render_delivery(d, room, CliHints(root, room.name, me), args.timeout))
     if d.state == "timeout":
         return EXIT_TIMEOUT
     room.set_cursor(me, d.status.last_seq)  # only after printing: at-least-once delivery
@@ -870,7 +1052,13 @@ def cmd_wait(args: argparse.Namespace) -> int:
 def cmd_send(args: argparse.Namespace) -> int:
     root, room = open_room(args)
     who = args.who
-    msg = room.publish(who, read_text_arg(args), end=args.end)
+    files = []
+    for path in args.attach or []:  # read by the agent's own process: its sandbox applies
+        try:
+            files.append((Path(path).name, Path(path).read_bytes()))
+        except OSError as e:
+            raise ChatError(f"can't read attachment {path}: {e.strerror or e}") from None
+    msg = room.publish(who, read_text_arg(args), end=args.end, attachments=files)
     cfg, st = room.config, room.status()
     if who == HUMAN:
         out(f"Sent #{msg.seq} as {HUMAN}. Room: {summary(cfg, st)}", f"Watch the replies: {cmd_hint(root, 'tail', room.name)}")
@@ -891,23 +1079,25 @@ def cmd_read(args: argparse.Namespace) -> int:
     st = room.status(msgs)
     if not args.who:
         shown = msgs[-args.last:] if args.last else msgs
-        out(transcript_header(room), *[fmt_message(m) for m in shown], f"Room: {summary(cfg, st)}")
+        hints = CliHints(root, room.name, "")
+        out(transcript_header(room), *[fmt_message(m, room, hints) for m in shown], f"Room: {summary(cfg, st)}")
         return EXIT_OK
     me = room.require_participant(args.who)
     seen = room.cursor(me)
     shown = [m for m in msgs if m.seq > seen and m.sender != me]
-    out(render_read(shown, cfg, st, me, CliHints(root, room.name, me)))
+    out(render_read(shown, room, st, me, CliHints(root, room.name, me)))
     room.set_cursor(me, st.last_seq)
     return EXIT_CLOSED if st.closed else EXIT_OK
 
 
 def cmd_tail(args: argparse.Namespace) -> int:
-    _, room = open_room(args)
+    root, room = open_room(args)
     cfg = room.config
+    hints = CliHints(root, room.name, "")
     msgs = room.messages()
     out(f"Room '{room.name}' — {cfg.topic or '(no topic)'}", f"Speaking order: {' → '.join(cfg.participants)}", "")
     for m in msgs[-args.last:] if args.last else msgs:
-        out(fmt_message(m))
+        out(fmt_message(m, room, hints))
     st = room.status(msgs)
     out(f"   · {summary(cfg, st)}", "")
     last = st.last_seq
@@ -917,7 +1107,7 @@ def cmd_tail(args: argparse.Namespace) -> int:
         new = [m for m in msgs if m.seq > last]
         if new:
             for m in new:
-                out(fmt_message(m))
+                out(fmt_message(m, room, hints))
             last = new[-1].seq
             st = room.status(msgs)
             out(f"   · {summary(cfg, st)}", "")
@@ -949,6 +1139,22 @@ def cmd_list(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_attachment(args: argparse.Namespace) -> int:
+    _, room = open_room(args)
+    a = room.find_attachment(args.id)
+    data = room.attachment_bytes(a.sha256)
+    if args.out:
+        atomic_write_bytes(Path(args.out), data)
+        out(f"Saved {a.name} ({human_size(a.size)}, {a.type}) to {args.out}")
+        return EXIT_OK
+    text = decode_text(data)
+    if text is None:
+        raise ChatError(f"{a.name} is binary ({a.type}, {human_size(a.size)}): save it with --out FILE")
+    sys.stdout.write(text if text.endswith("\n") else text + "\n")
+    sys.stdout.flush()
+    return EXIT_OK
+
+
 def cmd_close(args: argparse.Namespace) -> int:
     _, room = open_room(args)
     msg = room.publish(HUMAN, args.reason or "The human supervisor closed the conversation.", end=True)
@@ -959,6 +1165,15 @@ def cmd_close(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 # Web viewer (localhost only)
 # --------------------------------------------------------------------------
+
+
+def message_json(room: Room, m: Message) -> Dict[str, object]:
+    j = m.to_json()
+    for a, aj in zip(m.attachments, j["attachments"]):  # type: ignore[arg-type]
+        preview = room.attachment_preview(a)
+        aj["preview"] = preview[0] if preview else None
+        aj["lines"] = preview[1] if preview else None
+    return j
 
 
 def room_json(room: Room, after: int = 0) -> Dict[str, object]:
@@ -980,11 +1195,12 @@ def room_json(room: Room, after: int = 0) -> Dict[str, object]:
             "last_seq": st.last_seq,
             "end_proposed_by": list(st.end_proposed_by),
         },
-        "messages": [m.to_json() for m in msgs if m.seq > after],
+        "messages": [message_json(room, m) for m in msgs if m.seq > after],
     }
 
 
 ROOM_PATH_RE = re.compile(r"^/api/rooms/([a-z0-9][a-z0-9_-]{0,31})(/messages)?$")
+ATTACHMENT_PATH_RE = re.compile(r"^/api/rooms/([a-z0-9][a-z0-9_-]{0,31})/attachments/([0-9a-f]{8,64})$")
 
 
 def make_server(root: Path, host: str = "127.0.0.1", port: int = DEFAULT_PORT) -> ThreadingHTTPServer:
@@ -1021,9 +1237,11 @@ def make_server(root: Path, host: str = "127.0.0.1", port: int = DEFAULT_PORT) -
             p = self._port()
             return self.headers.get("Host", "") in {f"127.0.0.1:{p}", f"localhost:{p}"}
 
-        def _send(self, code: int, body: bytes, ctype: str) -> None:
+        def _send(self, code: int, body: bytes, ctype: str, extra: Optional[Dict[str, str]] = None) -> None:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
@@ -1058,6 +1276,19 @@ def make_server(root: Path, host: str = "127.0.0.1", port: int = DEFAULT_PORT) -
                         j.pop("messages")
                         data.append(j)
                     return self._json(200, {"rooms": data})
+                att = ATTACHMENT_PATH_RE.match(url.path)
+                if att:
+                    room = get_room(att.group(1))
+                    a = room.find_attachment(att.group(2))
+                    data = room.attachment_bytes(a.sha256)
+                    # Never served as HTML (or with its own type): agent-supplied bytes must not run
+                    # as a page on this origin. Download only, sandboxed, no sniffing.
+                    ctype = "text/plain; charset=utf-8" if decode_text(data) is not None else "application/octet-stream"
+                    safe = re.sub(r"[^A-Za-z0-9._-]", "_", a.name) or "attachment"
+                    return self._send(200, data, ctype, extra={
+                        "Content-Disposition": f'attachment; filename="{safe}"',
+                        "Content-Security-Policy": "default-src 'none'; sandbox",
+                    })
                 match = ROOM_PATH_RE.match(url.path)
                 if match and not match.group(2):
                     after = int(urllib.parse.parse_qs(url.query).get("after", ["0"])[0])
@@ -1120,7 +1351,22 @@ def cmd_serve(args: argparse.Namespace) -> int:
 THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
 
 
-def build_chat(cfg: Config, msgs: Sequence[Message], me: str, persona: str = "") -> List[Dict[str, str]]:
+BRIDGE_ATTACHMENT_CHARS = 8000
+
+
+def with_attachments(m: Message, room: "Optional[Room]") -> str:
+    """Message text plus shared files, for a model that can't call get_attachment itself."""
+    parts = [m.body]
+    for a in m.attachments:
+        text = decode_text(room.attachment_bytes(a.sha256)) if room is not None else None
+        if text is not None and len(text) <= BRIDGE_ATTACHMENT_CHARS:
+            parts.append(f"[attached file {a.name}]\n{text}")
+        else:
+            parts.append(f"[attached file {a.name}: {a.type}, {human_size(a.size)}, not shown]")
+    return "\n\n".join(parts)
+
+
+def build_chat(cfg: Config, msgs: Sequence[Message], me: str, persona: str = "", room: "Optional[Room]" = None) -> List[Dict[str, str]]:
     system = (
         f'You are "{me}", one participant in a live conversation between AI systems, '
         "possibly from different companies.\n"
@@ -1139,11 +1385,11 @@ def build_chat(cfg: Config, msgs: Sequence[Message], me: str, persona: str = "")
     chat = [{"role": "system", "content": system}]
     for m in msgs:
         if m.sender == me:
-            chat.append({"role": "assistant", "content": m.body})
+            chat.append({"role": "assistant", "content": with_attachments(m, room)})
         elif chat[-1]["role"] == "user":  # merge runs: strict chat templates want alternation
-            chat[-1]["content"] += f"\n\n[{m.sender}]: {m.body}"
+            chat[-1]["content"] += f"\n\n[{m.sender}]: {with_attachments(m, room)}"
         else:
-            chat.append({"role": "user", "content": f"[{m.sender}]: {m.body}"})
+            chat.append({"role": "user", "content": f"[{m.sender}]: {with_attachments(m, room)}"})
     if not msgs:
         chat.append({"role": "user", "content": "(The room is empty: you speak first. Open the conversation on the topic.)"})
     return chat
@@ -1230,7 +1476,7 @@ def cmd_bridge(args: argparse.Namespace) -> int:
         raw = chat_completion(
             args.base_url,
             args.model,
-            build_chat(cfg, msgs, me, persona),
+            build_chat(cfg, msgs, me, persona, room),
             api_key=api_key,
             temperature=args.temperature,
             timeout=args.request_timeout,
@@ -1346,6 +1592,20 @@ MCP_TOOLS: List[Dict[str, Any]] = [
             {
                 "text": {"type": "string", "description": "your message as plain text, without a name prefix"},
                 "end": {"type": "boolean", "description": "propose ending the conversation; it closes once every participant has agreed (default false)"},
+                "attachments": {
+                    "type": "array",
+                    "description": f"optional files to share (max {MAX_ATTACHMENTS_PER_MESSAGE}), with their content inline: "
+                    "the server never reads files from disk. They don't count toward the message length limit.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "file name, e.g. fix.diff"},
+                            "content": {"type": "string", "description": "the file's text"},
+                            "content_base64": {"type": "string", "description": "for binary files instead of content"},
+                        },
+                        "required": ["name"],
+                    },
+                },
                 **_WHO,
             },
             ["text"],
@@ -1359,6 +1619,13 @@ MCP_TOOLS: List[Dict[str, Any]] = [
         "whole transcript (useful to recover context).",
         "inputSchema": _obj({"all": {"type": "boolean", "description": "whole transcript instead of only unseen messages"}, **_WHO}),
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, **_LOCAL},
+    },
+    {
+        "name": "get_attachment",
+        "title": "Get an attachment",
+        "description": "Return the full text of a file shared in the room (messages show a 📎 line with its id and a preview).",
+        "inputSchema": _obj({"id": {"type": "string", "description": "the id shown next to the 📎 (8+ hex characters)"}, **_WHO}, ["id"]),
+        "annotations": {"readOnlyHint": True, "idempotentHint": True, **_LOCAL},
     },
 ]
 
@@ -1381,6 +1648,8 @@ ARG_ALIASES: Dict[str, Tuple[str, ...]] = {
     "text": ("text", "message", "content", "body", "msg"),
     "timeout_seconds": ("timeout_seconds", "timeoutSeconds", "timeout"),
     "all": ("all", "full"),
+    "attachments": ("attachments", "files"),
+    "id": ("id", "attachment_id", "attachment", "sha256", "hash"),
 }
 
 
@@ -1435,6 +1704,7 @@ class McpServer:
             "wait": self._tool_wait,
             "send": self._tool_send,
             "read": self._tool_read,
+            "get_attachment": self._tool_get_attachment,
         }
 
     # -- transport -----------------------------------------------------------
@@ -1649,7 +1919,7 @@ class McpServer:
             cancelled=lambda: self._eof.is_set() or (isinstance(rid, (str, int)) and rid in self._cancelled),
             on_tick=tick,
         )
-        text = render_delivery(d, room.config, self.hints, timeout)
+        text = render_delivery(d, room, self.hints, timeout)
         if d.state == "timeout":
             return text, None
         return text, lambda: room.set_cursor(me, d.status.last_seq)
@@ -1659,8 +1929,49 @@ class McpServer:
         text = _arg(args, "text")
         if not isinstance(text, str):
             raise ChatError("`text` must be a string with your message", EXIT_REJECTED)
-        msg = room.publish(me, text, end=parse_bool(args.get("end"), "end"), hints=self.hints)
+        msg = room.publish(
+            me, text, end=parse_bool(args.get("end"), "end"), hints=self.hints, attachments=self._inline_attachments(args)
+        )
         return render_sent(msg, room.config, room.status(), self.hints), None
+
+    @staticmethod
+    def _inline_attachments(args: Dict[str, Any]) -> List[Tuple[str, bytes]]:
+        raw = _arg(args, "attachments")
+        if raw is None:
+            return []
+        if not isinstance(raw, list):
+            raise ChatError("`attachments` must be a list of {name, content}", EXIT_REJECTED)
+        files = []
+        for item in raw:
+            if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                raise ChatError("each attachment needs a `name` and its `content`", EXIT_REJECTED)
+            if isinstance(item.get("content"), str):
+                files.append((item["name"], item["content"].encode("utf-8")))
+            elif isinstance(item.get("content_base64"), str):
+                try:
+                    files.append((item["name"], base64.b64decode(item["content_base64"], validate=True)))
+                except ValueError:
+                    raise ChatError(f"attachment {item['name']!r}: `content_base64` is not valid base64", EXIT_REJECTED) from None
+            else:
+                # Never read a path: the server runs outside the agent's sandbox, so doing so would
+                # let a sandboxed agent read (and share) files it isn't allowed to read.
+                raise ChatError(
+                    f"attachment {item['name']!r} has no `content`: put the file's text inline "
+                    "(the server never reads files from disk)",
+                    EXIT_REJECTED,
+                )
+        return files
+
+    def _tool_get_attachment(self, args: Dict[str, Any], **_: Any) -> Reply:
+        room, _me = self._session(args)
+        ref = _arg(args, "id")
+        if not isinstance(ref, str):
+            raise ChatError("`id` is required: the id shown next to the 📎")
+        a = room.find_attachment(ref)
+        text = decode_text(room.attachment_bytes(a.sha256))
+        if text is None:
+            raise ChatError(f"{a.name} is binary ({a.type}, {human_size(a.size)}) and can't be shown as text")
+        return f"📎 {a.name} · {a.type} · {human_size(a.size)} · id {a.short_id}\n{text}", None
 
     def _tool_read(self, args: Dict[str, Any], **_: Any) -> Reply:
         room, me = self._session(args)
@@ -1668,10 +1979,10 @@ class McpServer:
         msgs = room.messages()
         st = room.status(msgs)
         if parse_bool(_arg(args, "all"), "all"):
-            text = "\n".join([transcript_header(room), *[fmt_message(m) for m in msgs], turn_line(cfg, st, me, self.hints)])
+            text = "\n".join([transcript_header(room), *[fmt_message(m, room, self.hints) for m in msgs], turn_line(cfg, st, me, self.hints)])
         else:
             seen = room.cursor(me)
-            text = render_read([m for m in msgs if m.seq > seen and m.sender != me], cfg, st, me, self.hints)
+            text = render_read([m for m in msgs if m.seq > seen and m.sender != me], room, st, me, self.hints)
         return text, lambda: room.set_cursor(me, st.last_seq)
 
 
@@ -1732,10 +2043,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("send", parents=[in_room], help="post a message (text from argument, --file or stdin)")
     p.add_argument("--as", dest="who", required=True, help=f"your participant name, or '{HUMAN}'")
     p.add_argument("--file", help="read the message from a file")
+    p.add_argument("--attach", action="append", metavar="PATH",
+                   help=f"attach a file (repeatable, max {MAX_ATTACHMENTS_PER_MESSAGE}); it doesn't count toward --max-chars")
     p.add_argument("--end", action="store_true",
                    help="agents: propose ending (closes once every participant agrees); human: close at once")
     p.add_argument("text", nargs="?", help="message text as one single-quoted argument (or omit it and pipe stdin)")
     p.set_defaults(func=cmd_send)
+
+    p = sub.add_parser("attachment", parents=[in_room], help="print (or save) an attachment by its id")
+    p.add_argument("id", help="the id shown next to the 📎 (8+ hex characters), or @attachment:<id>")
+    p.add_argument("--out", help="save to this file instead of printing (required for binary files)")
+    p.set_defaults(func=cmd_attachment)
 
     p = sub.add_parser("read", parents=[in_room], help="show messages (with --as: only unread ones)")
     p.add_argument("--as", dest="who", help="show only what this participant hasn't read, and mark it read")

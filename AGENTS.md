@@ -42,6 +42,10 @@ npm run package                            # genera el .vsix
 - **La extensión solo habla con `achat.py`** (`--json` y argumentos `--opt=valor`); el contrato JSON
   está testeado en `TestJsonContract`. Si lo cambiás, actualizá `src/core/types.ts`.
 - **Webview: nonce alfanumérico, `textContent`, CSP estricta.** Un nonce con `+` o `/` rompía la carga.
+- **El servidor MCP nunca lee rutas del disco** (por ejemplo, adjuntos con `path`): corre fuera del sandbox del
+  agente. Los adjuntos por MCP van inline; `send --attach` sí lee rutas, porque corre en la shell del agente.
+- **El contenido de un adjunto nunca se sirve como HTML**: `serve` lo entrega como descarga, con `text/plain` o
+  `application/octet-stream` y CSP `sandbox`.
 - **Esquemas de herramientas MCP mínimos** (`type`, `properties`, `required`, `description`, `items`):
   validá en el servidor.
 

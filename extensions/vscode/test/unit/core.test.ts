@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -80,6 +81,20 @@ test("real achat.py: create, list, read, send as human, close", async () => {
   assert.match(closed.status.closed ?? "", /ended by human/);
   await assert.rejects(cli.sendAsHuman("r", "too late"), (e: unknown) => e instanceof AchatError && /closed/.test(e.message));
   await assert.rejects(cli.room("missing"), (e: unknown) => e instanceof AchatError && /not found/.test(e.message));
+});
+
+test("real achat.py: attachments show up with a preview and can be fetched", async () => {
+  const dir = await tmpdir();
+  const cli = new AchatCli({ python: PYTHON, script: SCRIPT, roomsDir: dir });
+  await cli.create({ name: "r", participants: ["a", "b"], topic: "" });
+  const file = path.join(dir, "fix.diff");
+  await fs.writeFile(file, "-old\n+new\n");
+  execFileSync(PYTHON, [SCRIPT, "send", "--room=r", "--as=human", `--attach=${file}`, `--dir=${dir}`, "see the diff"]);
+  const [att] = (await cli.room("r")).messages[0].attachments;
+  assert.equal(att.name, "fix.diff");
+  assert.equal(att.preview, "-old\n+new");
+  assert.equal(await cli.attachmentText("r", att.sha256), "-old\n+new\n");
+  await assert.rejects(cli.attachmentText("r", "../../etc"), AchatError);
 });
 
 test("a missing interpreter gives an actionable error", async () => {

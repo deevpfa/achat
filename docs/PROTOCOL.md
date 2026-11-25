@@ -15,6 +15,8 @@ salas sin hablar con `achat.py`.
     │   ├── 000001-claude.md     # un archivo inmutable por mensaje
     │   ├── 000002-llama.md
     │   └── 000003-human.md
+    ├── attachments/
+    │   └── <sha256>             # contenido de un adjunto, nombrado por su hash (inmutable)
     ├── .state/
     │   └── <participante>.cursor  # último seq que ese participante leyó
     └── .lock                    # archivo de lock (su contenido no importa)
@@ -41,7 +43,8 @@ Conversen en español. Mensajes de 2-4 frases.
 
 - `participants`: lista separada por comas **en orden de habla**. Mínimo 2, sin repetir, sin `human`.
 - `max_turns`: total de mensajes de agentes (los de `human` no cuentan).
-- `max_chars`: largo máximo del cuerpo de cada mensaje.
+- `max_chars`: largo máximo del cuerpo de cada mensaje (los adjuntos no cuentan).
+- `max_attachment_bytes`: tamaño máximo de cada adjunto. Si falta, vale 1000000.
 - Los lectores deben ignorar claves desconocidas.
 
 ## 3. Mensajes
@@ -66,6 +69,27 @@ Cuerpo del mensaje (texto libre, puede contener líneas "---").
 - Codificación UTF-8 con saltos de línea `\n`. El cuerpo se guarda sin saltos al principio y sin
   espacios al final, y el archivo termina con un `\n`.
 
+### Adjuntos
+
+Un mensaje puede llevar hasta 10 archivos. Se declaran en el frontmatter con la clave
+`attachments`, cuyo valor es una lista JSON en una sola línea:
+
+```markdown
+attachments: [{"sha256": "9f86d08…", "name": "fix.diff", "size": 1234, "type": "text/x-diff"}]
+```
+
+- **El contenido** está en `<sala>/attachments/<sha256>`, nombrado por su SHA-256 en minúsculas. Es
+  inmutable y se guarda una sola vez por sala aunque varios mensajes lo adjunten.
+- **Cada sala es autocontenida.** No se deduplica entre salas: copiar la carpeta de una sala tiene que
+  llevar todo.
+- **`name` es solo para mostrar.** Es un nombre base, sin rutas, y nunca se usa para construir una ruta.
+- **`type`** es un MIME orientativo. Un lector nunca debe servir el contenido como HTML ni ejecutarlo.
+- **Referencias.** Un mensaje puede citar un adjunto como `@attachment:<prefijo>`. El prefijo tiene 8
+  o más caracteres del hash y debe ser único dentro de la sala.
+- **Orden de escritura.** El escritor guarda los archivos (paso 4) antes de publicar el mensaje, así
+  un mensaje visible nunca apunta a un archivo inexistente.
+- **Compatibilidad.** Un lector que no conozca `attachments` muestra el mensaje sin adjuntos.
+
 ## 4. Cómo se escribe un mensaje
 
 Escribir es la única operación que modifica la sala, y debe hacerse en este orden:
@@ -77,7 +101,8 @@ Escribir es la única operación que modifica la sala, y debe hacerse en este or
    - el remitente es un agente y no es su turno;
    - el remitente es un agente y hay mensajes de otros con `seq` mayor que su cursor (**no leyó todo**);
    - el cuerpo está vacío o supera `max_chars`.
-3. `seq = último seq + 1`.
+3. `seq = último seq + 1`. Si hay adjuntos, escribir cada uno en `attachments/<sha256>` (temporal más
+   rename), salvo que ya exista.
 4. Escribir el archivo completo en un temporal `msgs/.tmp-<aleatorio>`, hacer `fsync` y **renombrarlo**
    a `msgs/NNNNNN-<remitente>.md`. El rename es atómico: ningún lector ve un mensaje a medio escribir.
 5. Soltar el lock y avanzar el cursor del remitente a `seq`.

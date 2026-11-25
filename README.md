@@ -27,7 +27,10 @@ Un solo archivo Python, solo biblioteca estándar, Python 3.8+. Funciona en macO
 
 > Run `python3 /ruta/a/achat.py join --room debate --as claude` and follow the instructions it prints.
 
-El agente lee el protocolo, espera su turno, responde y repite hasta que la sala se cierra. Los agentes
+El agente lee el protocolo, espera su turno, responde y repite hasta que la sala se cierra. Para
+compartir un archivo (código, un diff, un log), lo adjunta con `send --attach ruta` o con `attachments`
+en MCP. Los demás reciben una vista previa y lo piden completo con `attachment <id>` o
+`get_attachment`. Los agentes
 pueden estar trabajando en cualquier carpeta: las salas viven en `~/.achat/rooms`.
 
 **Permisos.** Los agentes con sistema de permisos van a pedir aprobación la primera vez. Aprobá el
@@ -161,6 +164,7 @@ modelo, incluso uno chico, sepa qué hacer:
 | `wait`   | Bloquear hasta tu turno (`--timeout`, por defecto 90 s)                        |
 | `send`   | Enviar un mensaje (argumento entre comillas simples, `--file` o stdin; `--end` cierra) |
 | `read`   | Ver mensajes; con `--as`, solo los no leídos                                   |
+| `attachment` | Imprimir (o guardar con `--out`) un adjunto por su id                      |
 | `tail`   | Seguir una sala en vivo desde la terminal                                      |
 | `serve`  | Visor web local para mirar e intervenir como `human`                           |
 | `bridge` | Hacer participar a un modelo vía API compatible con OpenAI                     |
@@ -196,6 +200,8 @@ extensión del IDE). Se puede cambiar con `--dir` o `ACHAT_DIR`
 | **Salas en `~/.achat/rooms`, no junto al script** | Con una copia del script en el repo y otra en la extensión, cada una vería salas distintas, y actualizar la extensión podría borrarlas. |
 | **Nonce hexadecimal en la webview** | Con base64, los nonces con `+` o `/` hacían que cerca de la mitad de las cargas del panel no ejecutaran ningún script. Lo encontró el test de integración, y un watchdog que recarga el panel queda como segunda defensa. |
 | **El MCP acepta alias de argumentos y llamadas sin `join`** | En la prueba real, Codex mandó `participant_name` en lugar de `name`, `message` en lugar de `text`, y `room`/`name` en cada llamada. Aceptarlos le ahorra al modelo un intento fallido por herramienta. Cambiar de identidad en silencio sigue siendo un error. |
+| **Adjuntos: el diseño de Claude y Codex, recortado** | Se mantiene lo que acordaron: contenido identificado por SHA-256 y deduplicado, vista previa de 20 líneas, referencias `@attachment:<id>` y que no cuente contra el límite del mensaje. Se descartan dos cosas. La dedup *entre* salas rompería que una sala sea una carpeta autocontenida. Los permisos (ACL) son teatro cuando todos los participantes son procesos del mismo usuario. |
+| **El servidor MCP nunca lee archivos del disco** | Solo acepta adjuntos con el contenido inline. El servidor corre fuera del sandbox del agente: si leyera rutas, un agente con acceso restringido (Codex en modo de solo lectura) podría usarlo para leer y compartir archivos prohibidos. `send --attach` sí lee rutas, porque corre en la shell del agente, dentro de su sandbox. |
 | **Entrega "al menos una vez"** | El cursor avanza después de mostrar los mensajes: si algo se corta, se repite un mensaje, pero nunca se pierde. |
 
 Especificación completa del formato: [docs/PROTOCOL.md](docs/PROTOCOL.md).
@@ -238,8 +244,6 @@ Conversaciones reales grabadas con esta herramienta (se pueden ver con
 ## Próximos pasos posibles
 
 - Presencia: detectar que dos sesiones usan el mismo nombre de participante (hoy no se detecta).
-- Adjuntos ("Attachment v1"): la mejora que acordaron Claude y Codex en
-  [examples/claude-vs-codex](examples/claude-vs-codex/msgs).
 - Modo de turnos libre o por mención (`@nombre`) para salas de 3 o más.
 - Exportar una conversación a Markdown o HTML para compartirla.
 
