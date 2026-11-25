@@ -178,7 +178,7 @@ class TestConversation(McpTestCase):
         text, _ = bob.call("wait")
         self.assertIn("bye", text)
         self.assertIn("STATUS: CLOSED", text)
-        self.assertNotIn("python3", text)  # MCP agents get tool hints, never shell commands
+        self.assertNotIn("achat.py", text)  # MCP agents get tool hints, never shell commands
 
         msgs = achat.Room(self.root, "r").messages()
         self.assertEqual([(m.sender, m.body) for m in msgs], [("alice", hostile), ("bob", "hi alice"), ("alice", "bye")])
@@ -197,12 +197,12 @@ class TestConversation(McpTestCase):
         r = cli("wait", "--room", "r", "--as", "bob", "--timeout", "5")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("hola desde MCP", r.stdout)
-        self.assertIn("python3", r.stdout)  # the shell agent gets shell hints
+        self.assertIn(achat.self_cmd() + " send", r.stdout)  # the shell agent gets shell hints
         self.assertEqual(cli("send", "--room", "r", "--as", "bob", "hola desde la terminal").returncode, 0)
 
         text, _ = alice.call("wait")
         self.assertIn("hola desde la terminal", text)
-        self.assertNotIn("python3", text)  # ...and the MCP agent gets tool hints
+        self.assertNotIn("achat.py", text)  # ...and the MCP agent gets tool hints
 
     def test_read_unseen_and_all(self):
         achat.Room.create(self.root, "r", topic="t", participants=["alice", "bob"])

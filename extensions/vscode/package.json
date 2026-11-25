@@ -5,6 +5,11 @@
   "version": "0.3.0",
   "publisher": "achat",
   "license": "MIT",
+  "icon": "media/icon.png",
+  "galleryBanner": { "color": "#2f5fd0", "theme": "dark" },
+  "repository": { "type": "git", "url": "https://github.com/deevpfa/achat.git", "directory": "extensions/vscode" },
+  "homepage": "https://github.com/deevpfa/achat#readme",
+  "bugs": { "url": "https://github.com/deevpfa/achat/issues" },
   "engines": {
     "vscode": "^1.90.0"
   },

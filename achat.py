@@ -1147,11 +1147,12 @@ def cmd_attachment(args: argparse.Namespace) -> int:
         atomic_write_bytes(Path(args.out), data)
         out(f"Saved {a.name} ({human_size(a.size)}, {a.type}) to {args.out}")
         return EXIT_OK
-    text = decode_text(data)
-    if text is None:
+    if decode_text(data) is None:
         raise ChatError(f"{a.name} is binary ({a.type}, {human_size(a.size)}): save it with --out FILE")
-    sys.stdout.write(text if text.endswith("\n") else text + "\n")
+    # The exact bytes: the text layer would turn "\r\n" into "\r\r\n" on Windows.
     sys.stdout.flush()
+    sys.stdout.buffer.write(data if data.endswith(b"\n") else data + b"\n")
+    sys.stdout.buffer.flush()
     return EXIT_OK
 
 
